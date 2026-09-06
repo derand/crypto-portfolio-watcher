@@ -1,0 +1,25 @@
+# Secrets and state live on the host, never in the repository.
+.env
+config/portfolio.yaml
+data/
+
+# SQLite, wherever it lands (VACUUM INTO snapshots, ad-hoc copies).
+*.db
+*.db-wal
+*.db-shm
+
+# Personal notes: host aliases and local paths.
+docs/dev_notes.md
+docs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+venv/
+.venv/
+
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,69 @@
+# One long-running process (watch = the tick loop plus the Telegram bot) and two
+# on-demand services.
+#
+#   docker compose up -d --build                     # start the watcher
+#   docker compose logs -f                           # see what it is doing
+#   docker compose --profile cli run --rm pw config-check
+#   docker compose --profile cli run --rm pw -v scan
+#   docker compose --profile dev run --rm tests
+#
+# Keys come from .env, addresses from config/portfolio.yaml. Neither is in the
+# image: both are bind-mounted from the host.
+
+x-app: &app
+  build:
+    context: .
+    target: base
+  image: portfolio-watcher:latest
+  # The uid:gid that ./data is written as on the host. 1000 is the default user
+  # on Raspberry Pi OS; if `id -u` says otherwise, put PUID/PGID in .env.
+  user: "${PUID:-1000}:${PGID:-1000}"
+  env_file: .env
+  environment:
+    # digest.hour is a local hour in the container. UTC by default: the times in
+    # the database are UTC too, so nothing is shifted twice. Set TZ in .env for
+    # your own zone.
+    TZ: "${TZ:-UTC}"
+    INIT_DB_ON_START: "true"
+  volumes:
+    # A directory, not a file: SQLite in WAL mode keeps -wal and -shm beside the
+    # database, and that is what makes it survive recreating the container.
+    - ./data:/app/data
+    # :ro - the watcher never writes the config; edits are made on the host.
+    - ./config:/app/config:ro
+
+services:
+  watcher:
+    <<: *app
+    container_name: portfolio-watcher
+    restart: unless-stopped
+    command: ["watch"]
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-off commands, same image and same database:
+  #   docker compose --profile cli run --rm pw status
+  pw:
+    <<: *app
+    profiles: ["cli"]
+    restart: "no"
+    command: ["config-check"]
+
+  # docker compose --profile dev run --rm tests
+  tests:
+    build:
+      context: .
+      target: dev
+    image: portfolio-watcher:dev
+    profiles: ["dev"]
+    # -p no:cacheprovider: /app in the image belongs to root, nowhere to cache
+    entrypoint: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    command: []
+    volumes:
+      # edits are picked up without rebuilding the image
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro

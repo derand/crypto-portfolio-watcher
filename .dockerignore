@@ -1,0 +1,15 @@
+# Secrets and state live on the host, not in the image.
+.env
+config/portfolio.yaml
+data/
+
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+docs/
+README.md
+CLAUDE.md
+pw

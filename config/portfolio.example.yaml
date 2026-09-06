@@ -1,0 +1,85 @@
+# Copy to config/portfolio.yaml and put real addresses there.
+# ${VAR} placeholders are read from .env / the environment.
+
+interval_minutes: 15
+db_path: data/portfolio.db
+
+thresholds:
+  # Balance moves worth less than this are recorded but never alerted.
+  # An asset with no known price is always announced, never silenced.
+  notify_usd: 1.0
+  # Shout when a perp's mark price gets this close to liquidation.
+  liq_distance_pct: 15.0
+  # Phase 7: remind to claim once pending rewards exceed this.
+  claim_reminder_usd: 50.0
+
+prices:
+  ttl_minutes: 15
+  # Prices for what a human asks for (/portfolio, the Refresh button). A number
+  # of its own, because the background TTL is a decision about the quota, while
+  # this one is the number on the screen.
+  command_ttl_minutes: 1
+
+digest:
+  enabled: true
+  hour: 9        # local hour for the daily summary
+  # table_width: 37   # characters that fit on one line of a collapsed block in
+  #                   # Telegram; wider tables wrap. Moves with the app's font size.
+
+notify:
+  telegram:
+    enabled: true
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    commands: true            # answer /portfolio, /digest… while watch is running
+  ntfy:
+    enabled: false
+    server: https://ntfy.sh
+    topic: ${NTFY_TOPIC}
+  discord:
+    enabled: false
+    webhook_url: ${DISCORD_WEBHOOK_URL}
+
+api_keys:
+  # Ethereum / Arbitrum / Base. Free tier, no card. https://dashboard.alchemy.com
+  alchemy: ${ALCHEMY_API_KEY}
+  etherscan: ${ETHERSCAN_API_KEY}
+  coingecko: ${COINGECKO_DEMO_KEY}
+
+# watch: what to poll for this address. Unknown values are rejected at load time.
+#   native | tokens | hyperliquid | beacon
+# chains: EVM networks to check (EVM addresses only).
+# Placeholders ship disabled: replace the address, then set enabled: true.
+addresses:
+  - chain: bitcoin
+    address: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+    label: btc-1
+    enabled: false
+    watch: [native]
+
+  - chain: bitcoin
+    address: bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97
+    label: btc-2
+    enabled: false
+    watch: [native]
+
+  - chain: evm
+    address: "0x0000000000000000000000000000000000000001"
+    label: main
+    enabled: false
+    chains: [ethereum, arbitrum, base, bsc]
+    watch: [native, tokens]
+
+  - chain: evm
+    address: "0x0000000000000000000000000000000000000002"
+    label: hl-1
+    enabled: false
+    watch: [hyperliquid]
+
+# Whitelist. Nothing outside this list is ever tracked as a token.
+tokens:
+  - chain: ethereum
+    contract: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    symbol: USDC
+    decimals: 6
+    coingecko_id: usd-coin

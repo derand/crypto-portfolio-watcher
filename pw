@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Run the watcher using the shared venv, without installing anything.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHONPATH="$here/src" exec "$here/../venv/bin/python" -m portfolio.cli "$@"
