@@ -99,6 +99,19 @@ range**, a discrete event meaning the liquidity stopped earning. Forks share the
 except in one place: Aerodrome Slipstream puts a tick spacing where Uniswap puts a fee tier
 and its factory takes `int24`, so it is a separate catalog kind rather than a guess.
 
+**Uniswap v4 keeps that arithmetic and replaces everything around it**
+(`protocols/univ4.py`, watch keyword `univ4`). Every pool lives inside one `PoolManager`, so
+there is no pool contract and no `slot0()` — the price is read with `extsload` at a slot
+computed from the pool id, which is itself `keccak(abi.encode(PoolKey))` and needs no lookup
+call. A pool is five fields (currency0, currency1, fee, tickSpacing, hooks): fee and spacing
+are independent where v3 tied them, and the hook contract is part of the pool's identity.
+`currency0` may be the zero address and mean real ETH. The position NFT is **not**
+ERC721Enumerable, so a wallet's positions cannot be listed by asking the contract, and
+`eth_getLogs` is not the answer either — the free tier serves it in **ten-block windows**;
+`EvmAdapter.owned_nfts` uses Alchemy's NFT index instead. Uncollected fees are not reported
+for v4 at all: v3's `collect()` can be simulated, v4's cannot, and computing fee growth from
+storage is arithmetic with nothing available to check it against.
+
 **Commands are the same code, read-only** (`bot.py`). `watch` runs the tick loop and a
 Telegram long-poll loop as two asyncio tasks in one process; `/portfolio` and `/digest`
 render exactly what the CLI renders, `/scan` calls the loop's own tick under a shared lock,

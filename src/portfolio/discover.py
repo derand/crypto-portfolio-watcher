@@ -398,7 +398,7 @@ def render_protocols(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-NFT_KINDS = ("univ3", "slipstream")
+NFT_KINDS = ("univ3", "slipstream", "univ4")
 
 
 async def position_managers(adapter: EvmAdapter, chain: str,
@@ -406,14 +406,16 @@ async def position_managers(adapter: EvmAdapter, chain: str,
     """label -> the factory each position manager points at, or "" if silent.
 
     A position manager has no receipt tokens to enumerate, so it cannot be
-    checked the way a lending market is. Asking it for its factory is the
-    cheapest question only a real one answers.
+    checked the way a lending market is. Asking it what it sits on top of is the
+    cheapest question only a real one answers - a factory for v3, and for v4 the
+    singleton pool manager, because v4 has no factory at all.
     """
     wanted = [e for e in entries if e.kind in NFT_KINDS]
     if not wanted:
         return {}
-    answers = await adapter.eth_call_many(
-        chain, [(e.address, abi.selector("factory()")) for e in wanted])
+    answers = await adapter.eth_call_many(chain, [
+        (e.address, abi.selector("poolManager()" if e.kind == "univ4"
+                                 else "factory()")) for e in wanted])
     return {e.label: (abi.decode_address(a) or "")
             for e, a in zip(wanted, answers)}
 
@@ -437,6 +439,23 @@ async def collect_nfts(cfg, adapter: EvmAdapter,
     for target in _targets(cfg):
         for chain in adapter.scopes(target):
             for entry in per_chain.get(chain, []):
+                if entry.kind == "univ4":
+                    # Not enumerable, and its liquidity has its own getter.
+                    ids = await adapter.owned_nfts(chain, target.address,
+                                                   entry.address)
+                    held = len(ids)
+                    if not held:
+                        continue
+                    live = sum(1 for x in await adapter.eth_call_many(
+                        chain, [(entry.address,
+                                 abi.selector("getPositionLiquidity(uint256)")
+                                 + f"{i:064x}") for i in ids])
+                        if abi.decode_uint(x))
+                    rows.append({"chain": chain, "protocol": entry.protocol,
+                                 "label": target.label, "count": held,
+                                 "live": live,
+                                 "watched": "univ4" in target.watch})
+                    continue
                 (answer,) = await adapter.eth_call_many(chain, [(
                     entry.address,
                     abi.encode_address("balanceOf(address)", target.address))])
@@ -477,10 +496,12 @@ def render_nfts(rows: list[dict]) -> str:
         tail = "" if r["watched"] or not r["live"] else "   <- not watched"
         lines.append(f"  {r['label']:12} {r['chain']:9} {r['protocol']:22} "
                      f"{r['live']} with liquidity{note}{tail}")
-    unwatched = {r["label"] for r in rows if r["live"] and not r["watched"]}
+    unwatched = {(r["label"], "univ4" if r["protocol"].endswith("-v4") else "univ3")
+                 for r in rows if r["live"] and not r["watched"]}
     if unwatched:
         lines.append("")
-        lines.append(f"Add `univ3` to the watch list of: {', '.join(sorted(unwatched))}")
+        for label, keyword in sorted(unwatched):
+            lines.append(f"Add `{keyword}` to the watch list of: {label}")
         lines.append("The amounts are computed from the pool price, so nothing "
                      "goes in `tokens:`.")
     return "\n".join(lines)

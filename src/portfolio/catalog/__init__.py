@@ -31,7 +31,7 @@ from pathlib import Path
 
 import yaml
 
-KINDS = {"aave_v3", "compound_v2", "univ3", "slipstream"}
+KINDS = {"aave_v3", "compound_v2", "univ3", "slipstream", "univ4"}
 """How to ask a protocol to enumerate its receipt tokens.
 
 `aave_v3`  - PoolAddressesProvider -> getPoolDataProvider() -> getAllATokens(),
@@ -50,6 +50,9 @@ KINDS = {"aave_v3", "compound_v2", "univ3", "slipstream"}
              field of positions() is a tick spacing rather than a fee tier, and
              the factory's getPool takes int24 instead of uint24. Calling the
              uint24 form on it reverts, which is how the difference was found.
+`univ4`    - a v4 PositionManager. Shares v3's arithmetic and none of its
+             plumbing: every pool lives inside one PoolManager, read through
+             `extsload`, and the NFT is not enumerable. protocols/univ4.py.
 """
 
 _FILE = Path(__file__).with_name("positions.yaml")

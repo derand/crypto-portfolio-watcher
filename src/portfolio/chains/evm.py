@@ -37,6 +37,8 @@ MAX_PAGES = 5
 DISCOVER_PAGES = 20                        # ~100 tokens a page; spam runs deep
 METADATA_BATCH = 20                        # metadata calls per JSON-RPC batch
 BALANCES_BATCH = 100                       # contracts per alchemy_getTokenBalances
+NFT_PAGE_SIZE = 100                        # token ids per NFT-index request
+NFT_PAGES = 10                             # a thousand positions is already absurd
 CALL_BATCH = 10
 """eth_calls per JSON-RPC batch, sized by the compute limit rather than by HTTP.
 
@@ -80,13 +82,15 @@ class EvmAdapter:
     def __init__(self, api_key: str, tokens: dict[str, list] | None = None,
                  client: httpx.AsyncClient | None = None,
                  url_template: str = "https://{net}.g.alchemy.com/v2/{key}",
-                 withdrawals=None):
+                 withdrawals=None,
+                 nft_url_template: str = "https://{net}.g.alchemy.com/nft/v3/{key}"):
         self._key = api_key
         self._tokens = tokens or {}          # network -> [TokenCfg]
         self._withdrawals = withdrawals      # BeaconWithdrawals, or None
         self._client = client
         self._own = client is None
         self._url = url_template
+        self._nft_url = nft_url_template
         self._id = 0
         self._warned: set[str] = set()
 
@@ -239,6 +243,58 @@ class EvmAdapter:
         else:
             log.warning("%s/%s: stopped after %d pages of token balances",
                         t.label, scope, DISCOVER_PAGES)
+        return out
+
+    async def owned_nfts(self, scope: str, owner: str, contract: str) -> list[int]:
+        """Token ids of one ERC-721 collection held by an address, right now.
+
+        Not JSON-RPC, and not by choice. The ordinary way to ask is
+        tokenOfOwnerByIndex, but Uniswap v4's position manager is deliberately
+        not ERC721Enumerable, so the question cannot be put to the contract at
+        all. The next way is to read Transfer logs - and on the free tier
+        `eth_getLogs` accepts a **ten block** range, which makes scanning from a
+        2025 deployment to now some hundreds of thousands of requests.
+
+        So this uses Alchemy's NFT index instead: same vendor, same key, one
+        request, and it answers current ownership rather than transfer history,
+        which saves filtering out everything since sold. Cross-checked against
+        Etherscan's transfer list on a live address - both named the same 35
+        positions.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=30.0)
+        base = self._nft_url.format(net=NETWORKS[scope][0], key=self._key)
+        out: list[int] = []
+        page = None
+        for _ in range(NFT_PAGES):
+            params = {"owner": owner, "contractAddresses[]": contract,
+                      "withMetadata": "false", "pageSize": NFT_PAGE_SIZE}
+            if page:
+                params["pageKey"] = page
+
+            async def fetch():
+                r = await self._client.get(f"{base}/getNFTsForOwner", params=params)
+                if r.status_code in (401, 403):
+                    raise Permanent(f"alchemy nft {r.status_code}: check ALCHEMY_API_KEY")
+                if r.status_code >= 400:
+                    raise RuntimeError(f"alchemy nft {scope}: HTTP {r.status_code}")
+                return r.json()
+
+            try:
+                body = await with_retry(fetch, what=f"alchemy nft {scope}")
+            except Unavailable as e:
+                raise Unavailable(redact(str(e), self._key)) from None
+            for item in body.get("ownedNfts") or []:
+                try:
+                    out.append(int(item["tokenId"]))
+                except (KeyError, ValueError):
+                    continue
+            page = body.get("pageKey")
+            if not page:
+                break
+        else:
+            log.warning("%s: stopped after %d pages of NFTs for %s",
+                        scope, NFT_PAGES, contract)
         return out
 
     async def balances_of(self, scope: str, address: str,

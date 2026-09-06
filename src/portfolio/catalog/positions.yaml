@@ -137,3 +137,28 @@
   kind: slipstream
   address: "0x827922686190790b37229fd06084350e74485b72"
   note: positions() field 4 is a tick spacing; getPool takes int24
+
+# Uniswap v4. The address is a PositionManager; the singleton PoolManager it
+# belongs to is read from it rather than written here, so a redeploy of one
+# cannot silently disagree with the other. All four answered symbol() and
+# poolManager() on 2026-09-06.
+
+- protocol: uniswap-v4
+  chain: ethereum
+  kind: univ4
+  address: "0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e"
+
+- protocol: uniswap-v4
+  chain: arbitrum
+  kind: univ4
+  address: "0xd88f38f930b7952f2db2432cb002e7abbf3dd869"
+
+- protocol: uniswap-v4
+  chain: base
+  kind: univ4
+  address: "0x7c5f5a4bbd8fd63184577525326123b519429bdc"
+
+- protocol: uniswap-v4
+  chain: bsc
+  kind: univ4
+  address: "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b"
