@@ -88,7 +88,7 @@ No test touches the network.
 | `.env`                    | API keys and bot tokens                          |
 | `data/portfolio.db`       | SQLite: balances, events, history                |
 | `src/portfolio/chains/`   | chain adapters (phases 1-2)                      |
-| `src/portfolio/protocols/`| Hyperliquid, beacon (validators)                 |
+| `src/portfolio/protocols/`| Hyperliquid, beacon, concentrated liquidity      |
 | `src/portfolio/notify/`   | Telegram, later ntfy and Discord                 |
 | `src/portfolio/discover.py`| whitelist candidates, run by hand               |
 | `src/portfolio/catalog/`  | protocol entry points; data, polled by no tick   |

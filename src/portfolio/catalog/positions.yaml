@@ -77,3 +77,63 @@
   chain: ethereum
   kind: compound_v2
   address: "0x3d9819210a31b4961b30ef54be2aed79b9c9cd3b"
+
+# Concentrated liquidity. The address is a NonfungiblePositionManager; every
+# one below answered symbol(), factory() and supportsInterface(ERC721Enumerable)
+# on 2026-09-06.
+
+- protocol: uniswap-v3
+  chain: ethereum
+  kind: univ3
+  address: "0xc36442b4a4522e871399cd717abdd847ab11fe88"
+
+- protocol: uniswap-v3
+  chain: arbitrum
+  kind: univ3
+  address: "0xc36442b4a4522e871399cd717abdd847ab11fe88"
+
+- protocol: uniswap-v3
+  chain: base
+  kind: univ3
+  address: "0x03a520b32c04bf3beef7beb72e919cf822ed34f1"
+
+- protocol: uniswap-v3
+  chain: bsc
+  kind: univ3
+  address: "0x7b8a01b39d58278b5de7e48c8449c9f4f5170613"
+
+- protocol: pancakeswap-v3
+  chain: bsc
+  kind: univ3
+  address: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
+
+- protocol: pancakeswap-v3
+  chain: ethereum
+  kind: univ3
+  address: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
+
+- protocol: pancakeswap-v3
+  chain: base
+  kind: univ3
+  address: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
+
+- protocol: pancakeswap-v3
+  chain: arbitrum
+  kind: univ3
+  address: "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364"
+
+- protocol: sushiswap-v3
+  chain: ethereum
+  kind: univ3
+  address: "0x2214a42d8e2a1d20635c2cb0664422c528b6a432"
+
+- protocol: sushiswap-v3
+  chain: arbitrum
+  kind: univ3
+  address: "0xf0cbce1942a68beb3d1b73f0dd86c8dcc363ef49"
+
+- protocol: aerodrome-slipstream
+  chain: base
+  kind: slipstream
+  address: "0x827922686190790b37229fd06084350e74485b72"
+  note: positions() field 4 is a tick spacing; getPool takes int24

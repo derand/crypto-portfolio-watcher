@@ -85,6 +85,20 @@ states which protocols a reader can *ask*, never which are held. A sweep uses
 at 26 compute units each, a single Aave market's 67 tokens exceed the free tier's 330 CU
 per second and the run dies on 429.
 
+**A concentrated-liquidity position is an ERC-721, and holds no amount**
+(`protocols/univ3.py`). Because each provider picks a price range, two stakes in one pool
+are not interchangeable, so there is no fungible LP token to whitelist — the NFT stores a
+liquidity coefficient and two tick bounds, and what it *holds* is computed from the pool's
+current price (`protocols/ticks.py`, integer-exact, ported from TickMath). Three consequences
+worth keeping: the composition drifts with every trade, so both legs are `accrues` and the
+probe marker carries the tick **bucketed to 60** rather than the amounts; uncollected fees
+are not in the NFT at all (`tokensOwed` only moves when the position is poked, so it reads
+zero on an untouched position) and are read by simulating `collect()` — which only answers
+the owner, hence `eth_call_many(sender=…)`; and the one alert worth having is **leaving the
+range**, a discrete event meaning the liquidity stopped earning. Forks share the interface
+except in one place: Aerodrome Slipstream puts a tick spacing where Uniswap puts a fee tier
+and its factory takes `int24`, so it is a separate catalog kind rather than a guess.
+
 **Commands are the same code, read-only** (`bot.py`). `watch` runs the tick loop and a
 Telegram long-poll loop as two asyncio tasks in one process; `/portfolio` and `/digest`
 render exactly what the CLI renders, `/scan` calls the loop's own tick under a shared lock,

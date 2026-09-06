@@ -396,3 +396,91 @@ def render_protocols(rows: list[dict]) -> str:
         lines.append(f"    # {r['protocol']}")
         lines.append("")
     return "\n".join(lines)
+
+
+NFT_KINDS = ("univ3", "slipstream")
+
+
+async def position_managers(adapter: EvmAdapter, chain: str,
+                            entries: list[catalog.Entry]) -> dict[str, str]:
+    """label -> the factory each position manager points at, or "" if silent.
+
+    A position manager has no receipt tokens to enumerate, so it cannot be
+    checked the way a lending market is. Asking it for its factory is the
+    cheapest question only a real one answers.
+    """
+    wanted = [e for e in entries if e.kind in NFT_KINDS]
+    if not wanted:
+        return {}
+    answers = await adapter.eth_call_many(
+        chain, [(e.address, abi.selector("factory()")) for e in wanted])
+    return {e.label: (abi.decode_address(a) or "")
+            for e, a in zip(wanted, answers)}
+
+
+async def collect_nfts(cfg, adapter: EvmAdapter,
+                       entries: list[catalog.Entry] | None = None) -> list[dict]:
+    """Which addresses hold concentrated-liquidity positions, and how many.
+
+    Nothing here is proposed for `tokens:` - a range position is not a token and
+    cannot be whitelisted; what it needs is `univ3` in the address's `watch`
+    list, which is what the report says.
+
+    Counting the NFTs is not enough to say that. Withdrawing all the liquidity
+    from a position leaves the NFT sitting in the wallet with nothing in it, and
+    an address whose five positions are all closed reads as five positions until
+    somebody asks each one. So each is asked.
+    """
+    entries = catalog.load() if entries is None else entries
+    per_chain = catalog.by_chain([e for e in entries if e.kind in NFT_KINDS])
+    rows = []
+    for target in _targets(cfg):
+        for chain in adapter.scopes(target):
+            for entry in per_chain.get(chain, []):
+                (answer,) = await adapter.eth_call_many(chain, [(
+                    entry.address,
+                    abi.encode_address("balanceOf(address)", target.address))])
+                held = abi.decode_uint(answer) or 0
+                if not held:
+                    continue
+                ids = [abi.decode_uint(x) for x in await adapter.eth_call_many(
+                    chain, [(entry.address,
+                             abi.selector("tokenOfOwnerByIndex(address,uint256)")
+                             + f"{int(target.address, 16):064x}{i:064x}")
+                            for i in range(held)])]
+                states = await adapter.eth_call_many(
+                    chain, [(entry.address, abi.selector("positions(uint256)")
+                             + f"{i:064x}") for i in ids if i is not None])
+                live = sum(1 for s in states if _liquidity(s))
+                rows.append({"chain": chain, "protocol": entry.protocol,
+                             "label": target.label, "count": held, "live": live,
+                             "watched": "univ3" in target.watch})
+    rows.sort(key=lambda r: (r["chain"], r["protocol"], r["label"]))
+    return rows
+
+
+def _liquidity(answer) -> int:
+    """Word 7 of positions(): the liquidity coefficient, zero once withdrawn."""
+    body = answer if isinstance(answer, str) else ""
+    if not body.startswith("0x") or len(body) < 2 + 64 * 8:
+        return 0
+    return int(body[2 + 64 * 7:2 + 64 * 8], 16)
+
+
+def render_nfts(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = ["", "Concentrated liquidity (not a token; cannot be whitelisted):"]
+    for r in rows:
+        empty = r["count"] - r["live"]
+        note = f", {empty} closed but not burned" if empty else ""
+        tail = "" if r["watched"] or not r["live"] else "   <- not watched"
+        lines.append(f"  {r['label']:12} {r['chain']:9} {r['protocol']:22} "
+                     f"{r['live']} with liquidity{note}{tail}")
+    unwatched = {r["label"] for r in rows if r["live"] and not r["watched"]}
+    if unwatched:
+        lines.append("")
+        lines.append(f"Add `univ3` to the watch list of: {', '.join(sorted(unwatched))}")
+        lines.append("The amounts are computed from the pool price, so nothing "
+                     "goes in `tokens:`.")
+    return "\n".join(lines)

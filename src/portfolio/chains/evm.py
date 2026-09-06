@@ -175,13 +175,19 @@ class EvmAdapter:
         return out
 
     async def eth_call_many(self, scope: str, calls: list[tuple[str, str]],
-                            chunk: int = CALL_BATCH) -> list:
+                            chunk: int = CALL_BATCH,
+                            sender: str | None = None) -> list:
         """`eth_call` a list of (to, calldata), several per round trip.
 
         Answers line up with `calls`; a call that reverted or hit a contract
         with no such method comes back None. Chunked because a batch of a
         hundred is refused by the provider rather than served slowly, and a
         catalog sweep across an Aave market reaches that size easily.
+
+        `sender` fills in `from`. Nothing needs it to read a balance, but a few
+        useful answers are only given to the owner: Uniswap's position manager
+        reports uncollected fees by simulating `collect()`, and simulates it as
+        whoever is asking.
         """
         out: list = []
         for i in range(0, len(calls), chunk):
@@ -193,7 +199,9 @@ class EvmAdapter:
                 # failure out. One batch a second stays under the line; the
                 # sweep is a manual command and can afford the wall clock.
                 await asyncio.sleep(CALL_PACE)
-            batch = [("eth_call", [{"to": to, "data": data}, "latest"])
+            batch = [("eth_call", [dict({"to": to, "data": data},
+                                         **({"from": sender} if sender else {})),
+                                    "latest"])
                      for to, data in calls[i:i + chunk]]
             # A sweep is the one caller that reliably meets the per-second
             # compute limit: it asks hundreds of questions back to back with no

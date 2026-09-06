@@ -360,3 +360,48 @@ async def test_a_debt_token_is_proposed_as_debt(cfg):
     assert "debt: true" in text
     assert "yield_bearing" not in text, "the debt rule replaces it, never joins it"
     assert "owed" in text, "the table says which way the money points"
+
+
+async def test_an_emptied_position_is_not_reported_as_one(cfg):
+    """Withdrawing the liquidity leaves the NFT in the wallet holding nothing.
+    Counting NFTs would report five positions to an address that has none, and
+    tell it to start watching something that is not there - which was exactly
+    what the first live run said."""
+    NFPM = "0x46267ab2c3d4e5f60718293a4b5c6d7e8f901234"
+    entry = catalog.Entry(protocol="pancakeswap-v3", chain="ethereum",
+                          kind="univ3", address=NFPM)
+    live = "0x" + word(0) * 7 + word(12345) + word(0) * 4
+    dead = "0x" + word(0) * 7 + word(0) + word(0) * 4
+    net = {
+        (NFPM, abi.encode_address("balanceOf(address)", ME)): enc_uint(2),
+        (NFPM, abi.selector("tokenOfOwnerByIndex(address,uint256)")
+         + word(int(ME, 16)) + word(0)): enc_uint(11),
+        (NFPM, abi.selector("tokenOfOwnerByIndex(address,uint256)")
+         + word(int(ME, 16)) + word(1)): enc_uint(22),
+        (NFPM, abi.selector("positions(uint256)") + word(11)): live,
+        (NFPM, abi.selector("positions(uint256)") + word(22)): dead,
+    }
+    a, _ = adapter(net)
+    rows = await discover.collect_nfts(cfg, a, [entry])
+    assert rows[0]["count"] == 2 and rows[0]["live"] == 1
+
+    text = discover.render_nfts(rows)
+    assert "1 with liquidity" in text and "1 closed but not burned" in text
+    assert "Add `univ3`" in text, "the live one is still worth watching"
+
+
+async def test_an_address_whose_positions_are_all_closed_is_not_told_to_watch(cfg):
+    NFPM = "0x46268bc3d4e5f60718293a4b5c6d7e8f90123456"
+    entry = catalog.Entry(protocol="pancakeswap-v3", chain="ethereum",
+                          kind="univ3", address=NFPM)
+    net = {
+        (NFPM, abi.encode_address("balanceOf(address)", ME)): enc_uint(1),
+        (NFPM, abi.selector("tokenOfOwnerByIndex(address,uint256)")
+         + word(int(ME, 16)) + word(0)): enc_uint(11),
+        (NFPM, abi.selector("positions(uint256)") + word(11)):
+            "0x" + word(0) * 12,
+    }
+    a, _ = adapter(net)
+    text = discover.render_nfts(await discover.collect_nfts(cfg, a, [entry]))
+    assert "0 with liquidity" in text
+    assert "Add `univ3`" not in text

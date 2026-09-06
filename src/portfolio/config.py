@@ -14,7 +14,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .protocols import PROTOCOL_SOURCES
+from .protocols import CHAIN_SCOPED_SOURCES, PROTOCOL_SOURCES
 
 CHAINS = {"bitcoin", "evm", "solana"}
 EVM_CHAINS = {"ethereum", "bsc", "arbitrum", "base", "polygon"}
@@ -182,9 +182,12 @@ class AddressCfg(BaseModel):
             if not re.fullmatch(r"0x[0-9a-fA-F]{40}", self.address):
                 raise ValueError(f"{self.label}: not an EVM address: {self.address}")
             object.__setattr__(self, "address", self.address.lower())
-            # native/tokens need a network list; hyperliquid-only addresses do not.
-            if {"native", "tokens"} & set(self.watch) and not self.chains:
-                raise ValueError(f"{self.label}: watch includes native/tokens but chains is empty")
+            # native/tokens need a network list, and so does any source that
+            # reads one network at a time; hyperliquid-only addresses do not.
+            needs_chains = ({"native", "tokens"} | CHAIN_SCOPED_SOURCES) & set(self.watch)
+            if needs_chains and not self.chains:
+                raise ValueError(f"{self.label}: watch includes "
+                                 f"{', '.join(sorted(needs_chains))} but chains is empty")
             if "beacon" in self.watch and not self.validators:
                 raise ValueError(f"{self.label}: watch includes beacon but validators "
                                  f"is empty; withdrawals alone do not say whose they are")

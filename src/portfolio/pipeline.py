@@ -570,6 +570,13 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
             asset_id = (_asset_id(conn, p.asset_key, p.symbol, p.decimals,
                                   getattr(p, "contract", ""))
                         if p.asset_key else None)
+            # Before the accrues shortcut below: a position whose amount is
+            # deliberately silent can still have crossed a line.
+            eid = _state_event(conn, cfg, chain, address_id, p, prev)
+            if eid:
+                res.new_events += 1
+                _queue(conn, eid, channels)
+
             _upsert_position(conn, address_id, p, asset_id)
 
             if p.key == "account" or p.accrues:
@@ -614,11 +621,6 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                         _queue(conn, eid, channels)
                     else:
                         res.below_threshold += 1
-
-            eid = _liq_event(conn, cfg, chain, address_id, p)
-            if eid:
-                res.new_events += 1
-                _queue(conn, eid, channels)
 
         for key, row in previous.items():
             if key in seen or key == "account":
@@ -668,6 +670,50 @@ def _px(text: str) -> str:
         return f"{float(text):,.2f}"
     except (TypeError, ValueError):
         return str(text)
+
+
+def _state_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
+    """An alert about a position's *state* rather than its size.
+
+    Separate from the amount diff, and reached even for positions marked
+    `accrues`, because the two answer different questions. A perp's value moves
+    every second and a range position's composition moves with every trade -
+    both are noise - yet each can cross a line that is worth exactly one
+    message: liquidation coming close, liquidity falling out of range.
+    """
+    return (_liq_event(conn, cfg, chain, address_id, p)
+            or _range_event(conn, chain, address_id, p, prev))
+
+
+def _range_event(conn, chain: str, address_id: int, p, prev) -> int | None:
+    """Concentrated liquidity left, or re-entered, its price range.
+
+    Reported on the transition rather than on the state, and read from what was
+    stored last tick: a position that is simply sitting outside its range is old
+    news, while the moment it stopped earning is the news. Uniswap's own
+    convention decides the edge - the upper bound is exclusive.
+    """
+    now = p.extra.get("in_range")
+    if now is None:
+        return None
+    was = None
+    if prev is not None and prev["extra"]:
+        try:
+            was = json.loads(prev["extra"]).get("in_range")
+        except (ValueError, TypeError):
+            was = None
+    if was is None or was == now:
+        return None                     # first sight, or nothing moved
+    venue = p.extra.get("venue", p.protocol)
+    pair = p.extra.get("token_id", "")
+    if now == "false":
+        text = (f"{venue} #{pair} {p.symbol} left its range - the liquidity "
+                f"stopped earning fees")
+    else:
+        text = f"{venue} #{pair} {p.symbol} is back in range and earning again"
+    return _position_event(
+        conn, chain, address_id, f"{p.key}:range:{now}:{p.extra.get('tick', '')}",
+        text, p.amount_raw)
 
 
 def _liq_event(conn, cfg, chain: str, address_id: int, p) -> int | None:

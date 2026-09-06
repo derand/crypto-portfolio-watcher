@@ -362,11 +362,14 @@ def cmd_discover_protocols(args) -> int:
 
     async def go():
         try:
-            return await discover.collect_protocols(cfg, adapter)
+            return (await discover.collect_protocols(cfg, adapter),
+                    await discover.collect_nfts(cfg, adapter))
         finally:
             await adapter.aclose()
 
-    print(discover.render_protocols(asyncio.run(go())))
+    rows, nfts = asyncio.run(go())
+    print(discover.render_protocols(rows))
+    print(discover.render_nfts(nfts))
     return 0
 
 
@@ -394,12 +397,16 @@ def cmd_catalog_check(args) -> int:
 
     async def go():
         try:
-            return {chain: await discover._receipts(adapter, chain, on_chain)
-                    for chain, on_chain in reachable.items()}
+            listed, managers = {}, {}
+            for chain, on_chain in reachable.items():
+                listed[chain] = await discover._receipts(adapter, chain, on_chain)
+                managers[chain] = await discover.position_managers(
+                    adapter, chain, on_chain)
+            return listed, managers
         finally:
             await adapter.aclose()
 
-    found = asyncio.run(go())
+    found, managers = asyncio.run(go())
     bad = 0
     print(f"{len(entries)} entries, "
           f"{len({e.protocol for e in entries})} protocols, "
@@ -407,6 +414,15 @@ def cmd_catalog_check(args) -> int:
     for entry in entries:
         if entry.chain in unreachable:
             print(f"  skip  {entry.label:26} no provider for {entry.chain}")
+            continue
+        if entry.kind in discover.NFT_KINDS:
+            factory = managers.get(entry.chain, {}).get(entry.label)
+            if factory:
+                print(f"  ok    {entry.label:26} position manager -> {factory}")
+            else:
+                bad += 1
+                print(f"  STALE {entry.label:26} named no factory - "
+                      f"check {entry.address}")
             continue
         tokens = (found.get(entry.chain, {}).get(entry.label) or {}).get("tokens")
         if tokens:

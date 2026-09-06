@@ -807,3 +807,98 @@ async def test_repaying_is_told_from_borrowing_by_the_sign(tmp_path):
 
     row = conn.execute("SELECT detail FROM events").fetchone()
     assert row["detail"] == "repaid 600 variableDebtUSDC"
+
+
+class FakeRangeSource:
+    """A concentrated-liquidity position that moves in and out of its range."""
+
+    name = "univ3"
+
+    def __init__(self, states):
+        self.states = states          # list of "true"/"false"
+        self.i = 0
+
+    async def fetch(self, t):
+        state = self.states[min(self.i, len(self.states) - 1)]
+        self.i += 1
+        p = Position(
+            protocol="univ3", key="ethereum:4242:0", symbol="WETH",
+            amount_raw=10 ** 18, decimals=18, asset_key="ethereum:native",
+            accrues=True,
+            extra={"venue": "uniswap-v3", "token_id": "4242", "tick": "-14377",
+                   "in_range": state})
+        return [p], f"{state}:{self.i}"
+
+
+UNIV3_CFG = EVM_CFG.replace("watch: [native]", "watch: [native, univ3]")
+
+
+def setup_univ3(tmp_path):
+    p = tmp_path / "u.yaml"
+    p.write_text(UNIV3_CFG.format(db=tmp_path / "u.db", a=EVM))
+    cfg = cfgmod.load(p, tmp_path / "missing.env")
+    conn = dbmod.connect(cfg.db_path)
+    dbmod.init(conn)
+    dbmod.sync_config(conn, cfg)
+    return cfg, conn
+
+
+async def test_falling_out_of_range_says_so_once(tmp_path):
+    """The one discrete thing that happens to a range position: the liquidity
+    stops earning. Everything else about it drifts, so this is the only part
+    worth a message - and repeating it every tick would bury it."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FakeRangeSource(["true", "false", "false"])
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+
+    said = [m.body for m in router.sent]
+    assert len(said) == 1, said
+    assert "left its range" in said[0] and "4242" in said[0]
+
+
+async def test_coming_back_into_range_is_worth_saying_too(tmp_path):
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FakeRangeSource(["true", "false", "true"])
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+
+    said = [m.body for m in router.sent]
+    assert len(said) == 2
+    assert "left its range" in said[0]
+    assert "back in range" in said[1]
+
+
+async def test_a_position_first_seen_out_of_range_does_not_alert(tmp_path):
+    """Day one records what is there; it does not announce a state that has
+    been true for months. The alert is about the transition."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FakeRangeSource(["false", "false"])
+    for _ in range(2):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+    assert router.sent == []
+
+
+async def test_the_drifting_amount_of_a_range_position_stays_silent(tmp_path):
+    """Its composition changes with every trade in the pool, with no transfer
+    behind it. That is digest material; alerting on it fires for as long as the
+    position exists."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+
+    class Drifting(FakeRangeSource):
+        async def fetch(self, t):
+            positions, _ = await super().fetch(t)
+            positions[0].amount_raw = 10 ** 18 + self.i * 10 ** 15
+            return positions, f"drift:{self.i}"
+
+    src = Drifting(["true", "true", "true"])
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+
+    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events")]
+    assert kinds and set(kinds) == {"accrual"}
+    assert router.sent == []

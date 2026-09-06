@@ -31,7 +31,7 @@ from pathlib import Path
 
 import yaml
 
-KINDS = {"aave_v3", "compound_v2"}
+KINDS = {"aave_v3", "compound_v2", "univ3", "slipstream"}
 """How to ask a protocol to enumerate its receipt tokens.
 
 `aave_v3`  - PoolAddressesProvider -> getPoolDataProvider() -> getAllATokens(),
@@ -42,6 +42,14 @@ KINDS = {"aave_v3", "compound_v2"}
              of each token separately. The value of a cToken lives in
              exchangeRateStored() rather than in the balance, so what discovery
              proposes for these carries a rate_call.
+`univ3`    - a NonfungiblePositionManager. Not a receipt token at all: a
+             concentrated-liquidity position is an ERC-721, and what it holds
+             has to be computed from the pool price. Read by protocols/univ3.py
+             rather than proposed for the whitelist.
+`slipstream` - the same interface with one difference that matters: the fourth
+             field of positions() is a tick spacing rather than a fee tier, and
+             the factory's getPool takes int24 instead of uint24. Calling the
+             uint24 form on it reverts, which is how the difference was found.
 """
 
 _FILE = Path(__file__).with_name("positions.yaml")
