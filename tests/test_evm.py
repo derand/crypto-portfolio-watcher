@@ -12,6 +12,7 @@ ME = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
 THEM = "0x1111111111111111111111111111111111111111"
 USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 SCAM = "0x9999999999999999999999999999999999999999"
+ZERO = "0x0000000000000000000000000000000000000000"
 
 TOKENS = {"ethereum": [TokenCfg(chain="ethereum", contract=USDC, symbol="USDC",
                                 decimals=6, coingecko_id="usd-coin")]}
@@ -487,3 +488,46 @@ def test_redact_leaves_short_strings_alone():
     assert redact("no key here", "") == "no key here"
     assert redact("a fine message", "a") == "a fine message"
     assert redact("url/v2/abcdefgh12", "abcdefgh12") == "url/v2/***"
+
+
+DEBT = "0xea51d7853eefb32b6ee06b1c12e6dcca88be0ffe"
+DEBT_TOKENS = {"ethereum": [TokenCfg(chain="ethereum", contract=DEBT,
+                                     symbol="variableDebtEthUSDC", decimals=6,
+                                     coingecko_id="usd-coin", debt=True)]}
+
+
+async def test_a_debt_balance_is_reported_negative():
+    """A debt token's balance is what is owed. Reported as a positive holding it
+    is added to the portfolio total, which is then wrong by twice the loan."""
+    answers = {"eth_blockNumber": "0x100", "eth_getBalance": "0x0",
+               "alchemy_getTokenBalances": {"tokenBalances": [
+                   {"contractAddress": DEBT, "tokenBalance": hex(1_000_000_000)}]}}
+    a, _ = adapter(answers, tokens=DEBT_TOKENS)
+    t = target()
+    probe = await a.probe(t, "ethereum", Cursor())
+    state = await a.fetch(t, "ethereum", Cursor(), probe)
+    held = [b for b in state.balances if b.asset_key == f"ethereum:{DEBT}"]
+    assert held[0].amount_raw == -1_000_000_000
+    assert held[0].debt is True
+    assert held[0].yield_bearing is False, "debt has its own rule, by size"
+
+
+def test_receiving_a_debt_token_moves_the_balance_down():
+    """Debt tokens are minted to the borrower, and Alchemy reports the mint as
+    an ordinary incoming transfer. Counted as income it disagrees with the
+    negative balance by twice the amount, and the reconciliation that should
+    have explained the borrow invents an anomaly instead."""
+    raw = transfer_doc("m1:0", "erc20", hex(500_000_000), from_=ZERO, to=ME,
+                       contract=DEBT)
+    made = EvmAdapter._to_transfer(raw, "ethereum", Direction.IN,
+                                   {DEBT: DEBT_TOKENS["ethereum"][0]}, ME)
+    assert made.amount_raw == 500_000_000, "the message still says how much"
+    assert made.effect == -500_000_000, "but net worth went down"
+
+
+def test_repaying_a_debt_token_moves_the_balance_up():
+    raw = transfer_doc("b1:0", "erc20", hex(500_000_000), from_=ME, to=ZERO,
+                       contract=DEBT)
+    made = EvmAdapter._to_transfer(raw, "ethereum", Direction.OUT,
+                                   {DEBT: DEBT_TOKENS["ethereum"][0]}, ME)
+    assert made.effect == 500_000_000

@@ -249,3 +249,29 @@ def test_validators_without_beacon_watch_are_rejected():
     with pytest.raises(ValidationError, match="beacon"):
         cfgmod.AddressCfg(chain="evm", address="0x" + "1" * 40, label="v",
                           chains=["ethereum"], watch=["native"], validators=[999999])
+
+
+def test_a_debt_token_must_name_what_it_is_denominated_in():
+    """Interest is told from a borrow by what the change is worth. With no price
+    there is no size, so every tick's interest would look like a new loan and
+    alert - forever."""
+    with pytest.raises(ValidationError, match="coingecko_id"):
+        cfgmod.TokenCfg(chain="ethereum", contract="0x" + "1" * 40,
+                        symbol="variableDebtUSDC", decimals=6, debt=True)
+
+
+def test_debt_and_yield_bearing_cannot_both_be_set():
+    """They are two rules for the same residual and yield_bearing is checked
+    first, so the pair silences interest whatever its size - and a six-figure
+    borrow passes without a word."""
+    with pytest.raises(ValidationError, match="debt"):
+        cfgmod.TokenCfg(chain="ethereum", contract="0x" + "1" * 40,
+                        symbol="variableDebtUSDC", decimals=6,
+                        coingecko_id="usd-coin", debt=True, yield_bearing=True)
+
+
+def test_a_debt_token_with_a_price_is_accepted():
+    t = cfgmod.TokenCfg(chain="ethereum", contract="0x" + "1" * 40,
+                        symbol="variableDebtUSDC", decimals=6,
+                        coingecko_id="usd-coin", debt=True)
+    assert t.debt is True and t.yield_bearing is False

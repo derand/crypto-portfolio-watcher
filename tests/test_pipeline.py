@@ -711,3 +711,99 @@ async def test_a_closed_position_is_printed_in_its_own_decimals(tmp_path):
 
     detail = conn.execute("SELECT detail FROM events WHERE detail LIKE 'closed%'").fetchone()[0]
     assert "32" in detail and "320000000000" not in detail, detail
+
+
+class FakeDebtChain:
+    """One address owing a variable debt token. `owed` is what the token says;
+    the snapshot carries it negated, the way the EVM adapter builds it."""
+
+    chain = "evm"
+
+    def __init__(self, owed):
+        self.owed = owed
+        self.i = 0
+
+    def scopes(self, t):
+        return ["ethereum"]
+
+    def _now(self):
+        return self.owed[min(self.i, len(self.owed) - 1)]
+
+    async def probe(self, t, scope, cursor):
+        marker = str(self._now())
+        return Probe(changed=marker != cursor.last_marker, marker=marker)
+
+    async def fetch(self, t, scope, cursor, probe):
+        owed = self._now()
+        self.i += 1
+        return AddressState(
+            balances=[BalanceSnapshot(asset_key="ethereum:0xdebt", amount_raw=-owed,
+                                      decimals=6, symbol="variableDebtUSDC",
+                                      debt=True)],
+            cursor=Cursor(last_marker=probe.marker))
+
+
+DEBT_PRICE = {"ethereum:0xdebt": 1.0}
+
+
+async def test_a_debt_is_recorded_as_a_negative_balance(tmp_path):
+    """The portfolio total is a sum. A debt stored positive is added to net
+    worth instead of taken off it, and the number is wrong by twice the loan."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {"evm": FakeDebtChain([1_000_000_000])},
+                             prices=FakePrices(DEBT_PRICE))
+    assert conn.execute(
+        "SELECT amount_raw FROM balances").fetchone()["amount_raw"] == "-1000000000"
+    # The valued snapshot is what the digest's total is built from.
+    assert conn.execute(
+        "SELECT usd FROM balance_snapshots").fetchone()["usd"] == -1000.0
+
+
+async def test_borrow_interest_does_not_ring(tmp_path):
+    """A debt grows every block. Alerting on that fires every tick for as long
+    as the loan exists - the exact failure the accrual channel exists for."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeDebtChain([1_000_000_000, 1_000_100_000])   # +0.10 USDC of interest
+    prices = FakePrices(DEBT_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    row = conn.execute("SELECT kind, detail, usd FROM events").fetchone()
+    assert row["kind"] == "accrual"
+    assert row["detail"] == "borrow interest"
+    assert abs(row["usd"] + 0.10) < 1e-9, "interest costs money; the sign says so"
+    assert router.sent == []
+
+
+async def test_borrowing_alerts_and_names_itself(tmp_path):
+    """Interest and a new loan move the same number, so nothing but its size
+    tells them apart. Silencing the balance outright - the way a vault share is
+    silenced - would let a six-figure borrow pass without a word."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeDebtChain([1_000_000_000, 1_500_000_000])   # +500 USDC borrowed
+    prices = FakePrices(DEBT_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    row = conn.execute("SELECT kind, detail, amount_raw FROM events").fetchone()
+    assert row["kind"] == "position_change"
+    assert row["detail"] == "borrowed 500 variableDebtUSDC"
+    assert row["amount_raw"] == "-500000000", "the debt grew; the sign is the point"
+    assert len(router.sent) == 1
+
+
+async def test_repaying_is_told_from_borrowing_by_the_sign(tmp_path):
+    """Both cross the threshold and both are position changes; a message that
+    called a repayment a borrow would be read as money going the wrong way."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeDebtChain([1_000_000_000, 400_000_000])     # 600 USDC repaid
+    prices = FakePrices(DEBT_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    row = conn.execute("SELECT detail FROM events").fetchone()
+    assert row["detail"] == "repaid 600 variableDebtUSDC"

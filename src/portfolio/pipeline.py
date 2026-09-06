@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .chains.base import Cursor, Target
-from .models import Direction, EventKind, Message, Severity, format_units
+from .models import (Direction, EventKind, Message, Severity, format_display,
+                     format_units)
 from .prices.sources import NATIVE_IDS
 from .retry import Unavailable
 
@@ -211,6 +212,26 @@ def _record_accrual(conn, chain: str, scope: str, address_id: int, asset_id: int
          EventKind.ACCRUAL.value, str(amount), usd, _now(), detail))
 
 
+def _record_debt_change(conn, chain: str, scope: str, address_id: int,
+                        asset_id: int, residual: int, symbol: str,
+                        decimals: int, usd: float | None) -> int:
+    """Somebody borrowed or repaid. Recorded as a position change, and alerted.
+
+    Not an anomaly: nothing here is unexplained. The balance of a debt token
+    moves for exactly two reasons, and this is the one that was a decision -
+    interest is handled above, silently, by being small.
+    """
+    verb = "borrowed" if residual < 0 else "repaid"
+    detail = f"{verb} {format_display(abs(residual), decimals)} {symbol}".strip()
+    cur = conn.execute(
+        """INSERT INTO events(chain, scope, address_id, asset_id, tx_hash, uid, kind,
+                              amount_raw, usd, ts, status, detail)
+           VALUES (?,?,?,?,'',?,?,?,?,?, 'confirmed', ?)""",
+        (chain, scope, address_id, asset_id, f"debt:{_now()}",
+         EventKind.POSITION_CHANGE.value, str(residual), usd, _now(), detail))
+    return cur.lastrowid
+
+
 def _record_anomaly(conn, chain: str, scope: str, address_id: int, asset_id: int,
                     delta: int, explained: int) -> int:
     """Balance moved by more than the transfers we found explain.
@@ -351,6 +372,21 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
                 # native coin without producing a transfer anyone wants alerted.
                 _record_accrual(conn, chain, scope, address_id, aid, residual,
                                 "network fees", accrued)
+                continue
+            if snap.debt:
+                # Interest and borrowing move the same number, so a flag cannot
+                # separate them - only size can. Under the threshold it is
+                # interest, which must never ring; over it somebody borrowed or
+                # repaid, which must. A debt token is required to carry a
+                # coingecko_id precisely so this comparison always has an answer.
+                if _worth_saying(cfg, accrued):
+                    eid = _record_debt_change(conn, chain, scope, address_id, aid,
+                                              residual, snap.symbol, snap.decimals,
+                                              accrued)
+                    _queue(conn, eid, channels)
+                else:
+                    _record_accrual(conn, chain, scope, address_id, aid, residual,
+                                    "borrow interest", accrued)
                 continue
             if snap.yield_bearing:
                 # The balance is shares x current rate while transfers are in

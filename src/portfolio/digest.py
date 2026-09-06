@@ -378,7 +378,10 @@ def _table(rows: list[dict], dust_usd: float = DUST_USD,
     holdings are only named and counted, because adding them up would invent a
     number. Thirteen addresses produce a dozen of each.
     """
-    dust = [r for r in rows if r["usd"] is not None and r["usd"] < dust_usd]
+    # abs(): a debt row is worth minus five thousand dollars, which is smaller
+    # than any dust threshold and is the last thing that should be folded away
+    # into "+3 under $1".
+    dust = [r for r in rows if r["usd"] is not None and abs(r["usd"]) < dust_usd]
     unpriced = [r for r in rows if r["usd"] is None]
     folded = {id(r) for r in dust} | {id(r) for r in unpriced}
     shown = [r for r in rows if id(r) not in folded]

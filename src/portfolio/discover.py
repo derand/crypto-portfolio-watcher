@@ -161,12 +161,19 @@ def render(rows: list[dict], min_usd: float,
 
 async def _receipts(adapter: EvmAdapter, chain: str,
                     entries: list[catalog.Entry]) -> dict[str, dict]:
-    """protocol/chain label -> {kind, tokens: [(symbol, receipt token)]}.
+    """protocol/chain label -> {kind, tokens: [{symbol, contract, debt}]}.
 
-    Two round trips for the whole network, whatever the protocol count: the
-    entry points are asked together, then the enumerations they point at are
-    asked together. Nothing here depends on an address, so the result is
-    computed once and reused for every wallet.
+    Three round trips of batches for the whole network, whatever the protocol
+    count: the entry points are asked together, then the enumerations they point
+    at, then the per-reserve lookup that names the debt tokens. Nothing here
+    depends on an address, so the result is computed once and reused for every
+    wallet.
+
+    Debt is included because a variable debt token is an ordinary ERC-20 and
+    therefore free to watch - it rides the same probe as everything else. Only
+    Aave-shaped markets offer it here; a Compound v2 fork keeps a borrow in
+    `borrowBalanceStored(address)`, which is a call rather than a balance and
+    has nowhere to sit in the whitelist.
     """
     aave = [e for e in entries if e.kind == "aave_v3"]
     comp = [e for e in entries if e.kind == "compound_v2"]
@@ -177,30 +184,53 @@ async def _receipts(adapter: EvmAdapter, chain: str,
     providers = [abi.decode_address(a) for a in answers[:len(aave)]]
     markets = [abi.decode_address_array(a) or [] for a in answers[len(aave):]]
 
-    out: dict[str, list[tuple[str, str]]] = {}
+    out: dict[str, dict] = {}
 
-    step2 = [(p, abi.selector("getAllATokens()")) for p in providers if p]
-    listed = await adapter.eth_call_many(chain, step2) if step2 else []
-    at = 0
+    live = [(e, p) for e, p in zip(aave, providers) if p]
     for entry, provider in zip(aave, providers):
         if provider is None:
             log.warning("%s: no pool data provider; catalog address may be stale",
                         entry.label)
-            continue
-        tokens = abi.decode_symbol_address_array(listed[at]) or []
-        at += 1
+
+    step2 = ([(p, abi.selector("getAllATokens()")) for _, p in live]
+             + [(p, abi.selector("getAllReservesTokens()")) for _, p in live])
+    listed = await adapter.eth_call_many(chain, step2) if step2 else []
+
+    # One call per reserve names its aToken and its two debt tokens. Batched
+    # across every market on the network, and never repeated per address.
+    step3, owners = [], []
+    for i, (entry, provider) in enumerate(live):
+        reserves = abi.decode_symbol_address_array(listed[len(live) + i]) or []
+        for _, underlying in reserves:
+            step3.append((provider, abi.encode_address(
+                "getReserveTokensAddresses(address)", underlying)))
+            owners.append(entry.label)
+    debts = await adapter.eth_call_many(chain, step3) if step3 else []
+
+    per_label: dict[str, list[dict]] = {}
+    for label, answer in zip(owners, debts):
+        # (aToken, stableDebtToken, variableDebtToken) - the third is the one
+        # that carries a modern borrow.
+        variable = abi.decode_address_at(answer, 2)
+        if variable:
+            per_label.setdefault(label, []).append(
+                {"symbol": "", "contract": variable.lower(), "debt": True})
+
+    for i, (entry, _) in enumerate(live):
+        tokens = abi.decode_symbol_address_array(listed[i]) or []
         if not tokens:
             log.warning("%s: the market listed no receipt tokens", entry.label)
-        out[entry.label] = {"kind": entry.kind,
-                            "tokens": [(s, a.lower()) for s, a in tokens]}
+        out[entry.label] = {"kind": entry.kind, "tokens": (
+            [{"symbol": s, "contract": a.lower(), "debt": False} for s, a in tokens]
+            + per_label.get(entry.label, []))}
 
     for entry, found in zip(comp, markets):
         if not found:
             log.warning("%s: the comptroller listed no markets", entry.label)
         # Symbols are not part of getAllMarkets(); they are asked of the few
         # markets that turn out to hold something, rather than of all 55.
-        out[entry.label] = {"kind": entry.kind,
-                            "tokens": [("", a.lower()) for a in found]}
+        out[entry.label] = {"kind": entry.kind, "tokens": [
+            {"symbol": "", "contract": a.lower(), "debt": False} for a in found]}
     return out
 
 
@@ -232,20 +262,21 @@ async def collect_protocols(cfg, adapter: EvmAdapter,
                 log.info("%s: %d receipt tokens across %d protocols",
                          chain, total, len(listings[chain]))
 
-            flat = [(label, found["kind"], symbol, contract)
+            flat = [(label, found["kind"], tok)
                     for label, found in listings[chain].items()
-                    for symbol, contract in found["tokens"]]
-            held = await adapter.balances_of(chain, target.address,
-                                             [c for _, _, _, c in flat])
+                    for tok in found["tokens"]]
+            held = await adapter.balances_of(
+                chain, target.address, [tok["contract"] for _, _, tok in flat])
 
-            for label, kind, symbol, contract in flat:
+            for label, kind, tok in flat:
+                contract = tok["contract"]
                 raw = held.get(contract)
                 if not raw:
                     continue
                 row = rows.setdefault((chain, contract), {
                     "chain": chain, "contract": contract, "protocol": label,
-                    "kind": kind, "symbol": symbol, "holders": {},
-                    "known": (chain, contract) in known})
+                    "kind": kind, "symbol": tok["symbol"], "debt": tok["debt"],
+                    "holders": {}, "known": (chain, contract) in known})
                 row["holders"][target.label] = raw
             log.info("%s/%s: swept %d receipt tokens", target.label, chain, len(flat))
 
@@ -324,8 +355,9 @@ def render_protocols(rows: list[dict]) -> str:
             if decimals is not None else f"{k} {v} raw"
             for k, v in r["holders"].items())
         tail = "  [already in config]" if r["known"] else ""
+        owed = "owed  " if r.get("debt") else ""
         lines.append(f"{r['chain']:9} {r['protocol'].split('/')[0]:16} "
-                     f"{(r['symbol'] or '?'):18} {who}{tail}")
+                     f"{(r['symbol'] or '?'):18} {owed}{who}{tail}")
 
     fresh = [r for r in rows if not r["known"] and r.get("decimals") is not None]
     lines.append(f"\n{len(rows)} positions found, {len(fresh)} not yet whitelisted.")
@@ -350,7 +382,11 @@ def render_protocols(rows: list[dict]) -> str:
         lines.append(f"    symbol: {r['symbol'] or '?'}")
         lines.append(f"    decimals: {decimals}")
         lines.append(f"    coingecko_id:        # underlying: {underlying}")
-        if share:
+        if r.get("debt"):
+            # Owed, not held. The id above is not optional for these: interest
+            # is told from a borrow by what the change is worth.
+            lines.append("    debt: true")
+        elif share:
             # The balance is shares; the value lives in the rate, and the rate
             # is scaled by 1e18 whatever the underlying's own decimals are.
             lines.append('    rate_call: "exchangeRateStored()"')

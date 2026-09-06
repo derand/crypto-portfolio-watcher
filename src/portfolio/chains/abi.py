@@ -63,6 +63,20 @@ def decode_address(data) -> str | None:
     return f"0x{value:040x}"
 
 
+def decode_address_at(data, index: int) -> str | None:
+    """One address out of a fixed-size tuple of them.
+
+    Aave's getReserveTokensAddresses answers (aToken, stableDebtToken,
+    variableDebtToken) as three plain words; the third is the only one that
+    matters, and slicing it out beats decoding a struct.
+    """
+    b = _body(data)
+    if b is None or len(b) < WORD * (index + 1):
+        return None
+    value = _word(b, index * WORD)
+    return f"0x{value:040x}" if value else None
+
+
 def decode_address_array(data) -> list[str] | None:
     """A dynamic address[], as Comptroller.getAllMarkets() returns."""
     b = _body(data)

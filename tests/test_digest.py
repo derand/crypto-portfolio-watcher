@@ -539,3 +539,17 @@ def test_a_dollar_figure_is_never_shortened_to_fit():
     recent = [_event("accrual", "aArbwstETH", 5 * 10**17, "savings-evm", 1234.56)]
     _, detail = digest._last24h(recent, width=20)
     assert "$1,234.56" in detail[0], detail
+
+
+def test_a_debt_is_never_folded_away_as_small_change():
+    """The dust line hides holdings too small to earn a row. A debt is worth a
+    negative number, which is smaller than any threshold - so a naive test folds
+    a five-thousand-dollar loan into "+1 under $1" and subtracts it from the
+    dust total, where nobody is looking."""
+    rows = [_row(10**18, 18, "ETH", "sav-evm·eth", 4_000.0),
+            _row(-5_000_000_000, 6, "variableDebtUSDC", "main·eth", -5_000.0),
+            _row(10**15, 18, "ETH", "dust·eth", 0.40)]
+    lines = digest._table(rows, dust_usd=1.0, width=60)
+    body = "\n".join(lines)
+    assert "variableDebt" in body or "-5" in body, "the loan earns its own row"
+    assert "+1 under $1" in body, "only the forty cents is dust"

@@ -335,3 +335,28 @@ async def test_a_native_coin_market_is_still_a_share(cfg):
     assert 'rate_call: "exchangeRateStored()"' in text
     assert "decimals: 18" in text, "the position is measured in the native coin"
     assert "the native coin" in text
+
+
+async def test_a_debt_token_is_proposed_as_debt(cfg):
+    """A variable debt token is an ordinary ERC-20, so watching it costs nothing
+    extra - it rides the same probe. What it needs is the flag that gives it a
+    sign; proposed without one it would be added to net worth instead of taken
+    off it."""
+    VDEBT = "0x46266ea1b2c3d4e5f60718293a4b5c6d7e8f9012"
+    net = dict(AAVE_NET)
+    net[(DATA, sel("getAllReservesTokens()"))] = enc_sym_addr_array([("WETH", WETH)])
+    net[(DATA, abi.encode_address("getReserveTokensAddresses(address)", WETH))] = (
+        "0x" + word(int(AWETH, 16)) + word(0) + word(int(VDEBT, 16)))
+    net[(VDEBT, sel("symbol()"))] = enc_string("variableDebtEthWETH")
+    net[(VDEBT, sel("decimals()"))] = enc_uint(18)
+    net[(VDEBT, sel("UNDERLYING_ASSET_ADDRESS()"))] = enc_addr(WETH)
+
+    a, _ = adapter(net, {(VDEBT, ME): 3 * 10 ** 18})
+    rows = await discover.collect_protocols(cfg, a, [AAVE_ENTRY])
+    assert [r["symbol"] for r in rows] == ["variableDebtEthWETH"]
+    assert rows[0]["debt"] is True
+
+    text = discover.render_protocols(rows)
+    assert "debt: true" in text
+    assert "yield_bearing" not in text, "the debt rule replaces it, never joins it"
+    assert "owed" in text, "the table says which way the money points"

@@ -13,6 +13,7 @@ method on it answers 403 - including eth_blockNumber, which makes a missing
 toggle look like a missing network.
 """
 
+import asyncio
 import logging
 
 import httpx
@@ -44,6 +45,7 @@ an eth_call, so a batch of fifty is four times over the line and answers 429 -
 which a catalog sweep meets immediately, because it asks hundreds of questions
 back to back with no think time between them. Ten fits; the sweep is a manual
 command, so the extra round trips cost nobody anything."""
+CALL_PACE = 1.0                            # seconds between sweep batches
 RATE_MARKER_DP = 4                         # decimals of the rate the marker sees
 
 
@@ -183,6 +185,14 @@ class EvmAdapter:
         """
         out: list = []
         for i in range(0, len(calls), chunk):
+            if i:
+                # Pace the batches rather than only retrying them. Enumerating
+                # every reserve of every market on Ethereum is a hundred-odd
+                # calls issued back to back - some 3000 compute units inside one
+                # second against a limit of 330 - and backoff only stretches the
+                # failure out. One batch a second stays under the line; the
+                # sweep is a manual command and can afford the wall clock.
+                await asyncio.sleep(CALL_PACE)
             batch = [("eth_call", [{"to": to, "data": data}, "latest"])
                      for to, data in calls[i:i + chunk]]
             # A sweep is the one caller that reliably meets the per-second
@@ -313,11 +323,18 @@ class EvmAdapter:
                 # yield lives entirely in the rate, so a raw balance would look
                 # frozen while the position quietly grows.
                 amount = amount * rate // 10 ** tok.share_decimals
+            if tok.debt:
+                # A debt token's balance is what is owed. Negating it here, at
+                # the one place a balance is built, is what makes every total
+                # downstream subtract it - the digest, the portfolio and the
+                # residual arithmetic all take the sign for granted.
+                amount = -amount
             out.append(BalanceSnapshot(
                 asset_key=f"{scope}:{tok.contract}",
                 amount_raw=amount,
                 decimals=tok.decimals, symbol=tok.symbol,
                 block_height=probe.raw["tip"],
+                debt=tok.debt,
                 yield_bearing=bool(rate) or tok.yield_bearing))
         return out
 
@@ -397,9 +414,11 @@ class EvmAdapter:
             if token is None:
                 return None
             asset_key, symbol, decimals = f"{scope}:{contract}", token.symbol, token.decimals
+            debt = token.debt
         else:
             asset_key = f"{scope}:native"
             symbol, decimals = NETWORKS[scope][1], NATIVE_DECIMALS
+            debt = False
 
         # rawContract.value is the exact integer; the sibling "value" field is a
         # float and silently loses precision on large amounts.
@@ -416,6 +435,17 @@ class EvmAdapter:
         ts = (datetime.fromisoformat(ts_text.replace("Z", "+00:00"))
               if ts_text else datetime.now(timezone.utc))
 
+        # Debt tokens are minted to the borrower and burned on repayment, and
+        # Alchemy reports both as ordinary transfers from and to the zero
+        # address. Receiving one is not income: it moves the recorded balance
+        # down, because the recorded balance is negative. Without this the
+        # transfer and the balance disagree by twice the amount, and the
+        # reconciliation that is supposed to explain a borrow invents an
+        # anomaly instead.
+        effect = None
+        if debt:
+            effect = -amount if direction is Direction.IN else amount
+
         return Transfer(
             tx_hash=raw["hash"],
             uid=raw["uniqueId"],              # stable per movement, not per tx
@@ -427,4 +457,5 @@ class EvmAdapter:
             ts=ts,
             symbol=symbol,
             decimals=decimals,
+            balance_effect=effect,
         )

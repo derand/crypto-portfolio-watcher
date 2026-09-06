@@ -228,6 +228,20 @@ class TokenCfg(BaseModel):
     ETH. Presentation only - never a price or an amount - and deliberately not
     guessed from the symbol, because ETHFI is not ETH. Empty means the token
     stands as its own group."""
+    debt: bool = False
+    """True when the balance is money *owed*, not held - a variable debt token.
+
+    Such a token is an ordinary ERC-20 with an ordinary balance, so it rides the
+    same probe as everything else and costs no extra request. What it needs is a
+    sign: the position is recorded negative, which is what makes the portfolio
+    total subtract it instead of celebrating it.
+
+    Interest is the mirror of vault yield - the balance climbs on its own and
+    must not alert - but unlike yield it cannot simply be silenced, because
+    borrowing more moves the same number. The two are told apart by size: a
+    residual under `thresholds.notify_usd` is interest, anything larger is a
+    borrow or a repayment. That rule needs a price, which is why coingecko_id
+    is required below."""
     yield_bearing: bool = False
     """True when the balance grows on its own - an Aave aToken rebasing, or a
     share whose rate_call climbs. Such growth is yield, so it goes to the digest
@@ -264,6 +278,20 @@ class TokenCfg(BaseModel):
             object.__setattr__(self, "yield_bearing", True)
             if not self.share_decimals:
                 object.__setattr__(self, "share_decimals", self.decimals)
+        if self.debt:
+            if self.yield_bearing:
+                # Both flags claim the residual, and yield_bearing is checked
+                # first: interest would be silenced whatever its size, and a
+                # six-figure borrow would pass without a word.
+                raise ValueError(f"{self.symbol}: debt and yield_bearing are "
+                                 f"different rules for the same residual; "
+                                 f"a debt token needs only debt: true")
+            if not self.coingecko_id:
+                # Without a price there is no size, and without a size interest
+                # cannot be told from a borrow - so every tick would alert.
+                raise ValueError(f"{self.symbol}: debt needs coingecko_id naming "
+                                 f"the borrowed asset; interest is told from a "
+                                 f"borrow by what it is worth")
         object.__setattr__(self, "contract", self.contract.lower())
         return self
 

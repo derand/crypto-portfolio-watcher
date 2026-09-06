@@ -85,6 +85,12 @@ class BalanceSnapshot:
     failed swap, any contract call. A negative unexplained residual on such an
     asset is fees, not a missing transfer, and must not cry wolf.
     """
+    debt: bool = False
+    """True when `amount_raw` is negative because the balance is money owed.
+
+    Not a third kind of yield flag: a debt residual is interest when it is small
+    and a borrow when it is large, so the pipeline sizes it rather than trusting
+    a flag. See TokenCfg.debt."""
     yield_bearing: bool = False
     """True for shares whose redemption value grows on its own (ERC-4626).
 

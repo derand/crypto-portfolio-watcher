@@ -408,9 +408,12 @@ def cmd_catalog_check(args) -> int:
         if entry.chain in unreachable:
             print(f"  skip  {entry.label:26} no provider for {entry.chain}")
             continue
-        tokens = found.get(entry.chain, {}).get(entry.label)
+        tokens = (found.get(entry.chain, {}).get(entry.label) or {}).get("tokens")
         if tokens:
-            print(f"  ok    {entry.label:26} {len(tokens):3} receipt tokens")
+            debt = sum(1 for t in tokens if t["debt"])
+            held = len(tokens) - debt
+            owed = f" + {debt} debt" if debt else ""
+            print(f"  ok    {entry.label:26} {held:3} receipt tokens{owed}")
         else:
             bad += 1
             print(f"  STALE {entry.label:26} listed nothing - check {entry.address}")

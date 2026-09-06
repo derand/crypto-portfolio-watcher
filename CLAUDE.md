@@ -146,6 +146,8 @@ promise as money. Beacon validators are on-chain — the ETH is staked, not depo
 |---|---|---|
 | gas burns native ETH, no transfer | `BalanceSnapshot.fee_bearing` | negative residual → `accrual`, silent |
 | balance grows on its own (Aave rebase, vault share) | `BalanceSnapshot.yield_bearing` | residual → `accrual`, silent |
+| a debt grows on its own (borrow interest) | `BalanceSnapshot.debt`, residual under the threshold | `accrual`, silent |
+| a debt jumps (borrow or repayment) | `BalanceSnapshot.debt`, residual over the threshold | `position_change` → alerts |
 | position grows on its own (validator, HL account) | `Position.accrues` | change → `accrual`, silent |
 | money appears with nothing to explain it | neither flag | `anomaly` → alerts |
 
@@ -181,6 +183,13 @@ Beyond `chain`/`contract`/`symbol`/`decimals`:
 - `rate_from` — the contract answering `rate_call`, when it is not the token itself.
 - `share_decimals` — when the share's scale differs from the asset's (18-decimal shares of
   6-decimal USDC). Defaults to `decimals`.
+- `debt` — the balance is money *owed*, so it is recorded negative and the totals subtract
+  it. A variable debt token is an ordinary ERC-20, so this costs no extra request: it rides
+  the same probe. Interest and borrowing move the same number, so no flag can separate
+  them — the pipeline sizes the change instead. Under `thresholds.notify_usd` it is interest
+  and goes to the digest; over it, somebody borrowed or repaid and it alerts. That is why
+  `coingecko_id` is required here, and why `debt` and `yield_bearing` together are refused:
+  `yield_bearing` is checked first and would silence a six-figure borrow.
 - `group` — which holding this counts as in the digest: aBasWETH and WSTETH are both `ETH`.
   Display only, and never guessed from the symbol — ETHFI is not ETH. Empty means the token
   is its own group.
