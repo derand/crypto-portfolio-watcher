@@ -7,6 +7,21 @@ import random
 log = logging.getLogger(__name__)
 
 
+def redact(text: str, *secrets: str) -> str:
+    """Remove API keys from text that is about to become a message.
+
+    httpx puts the full URL in every HTTPStatusError, and two providers carry
+    their key in that URL - Alchemy as a path segment, Etherscan as `apikey=`.
+    That text travels: an adapter failure lands in `ScanResult.failed`, and the
+    bot prints those straight into a Telegram message. So a provider answering
+    429 was enough to publish the key to the chat.
+    """
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "***")
+    return text
+
+
 class Unavailable(Exception):
     """Provider failed every attempt. Callers treat this as 'no data this tick'."""
 

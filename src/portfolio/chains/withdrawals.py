@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 import httpx
 
 from ..models import Direction, Transfer
-from ..retry import Permanent, with_retry
+from ..retry import Permanent, Unavailable, redact, with_retry
 
 log = logging.getLogger(__name__)
 
@@ -77,10 +77,17 @@ class BeaconWithdrawals:
 
         async def call():
             r = await self._client.get(self._url, params=params)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Not raise_for_status(): Etherscan takes its key as `apikey=`
+                # in the query string, and httpx puts the whole URL in the
+                # message - which ends up in a Telegram failure line.
+                raise RuntimeError(f"etherscan: HTTP {r.status_code}")
             return r.json()
 
-        body = await with_retry(call, what="etherscan withdrawals")
+        try:
+            body = await with_retry(call, what="etherscan withdrawals")
+        except Unavailable as e:
+            raise Unavailable(redact(str(e), self._key)) from None
         result = body.get("result")
         if isinstance(result, list):
             return result

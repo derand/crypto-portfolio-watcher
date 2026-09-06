@@ -458,3 +458,32 @@ async def test_a_beacon_only_address_is_still_polled_on_ethereum():
 async def test_an_explicit_chain_list_still_wins_for_a_beacon_address():
     a, _ = adapter(dict(BALANCES))
     assert a.scopes(target(chains=("base",), watch=("beacon", "native"))) == ["base"]
+
+
+async def test_a_provider_error_never_carries_the_api_key():
+    """An adapter failure becomes text: pipeline puts it in ScanResult.failed and
+    the bot prints those lines into a Telegram message. httpx's own message for a
+    bad status contains the whole URL, and the Alchemy key is a path segment of
+    it - so a provider answering 429 was enough to publish the key to the chat."""
+    from portfolio.retry import Unavailable
+
+    def handler(request):
+        return httpx.Response(429, json={"error": "rate limited"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    a = EvmAdapter("s3cret-alchemy-key", {}, client=client,
+                   url_template="http://{net}/{key}")
+    with pytest.raises(Unavailable) as caught:
+        await a.probe(target(), "ethereum", Cursor())
+    assert "s3cret-alchemy-key" not in str(caught.value)
+    assert "429" in str(caught.value), "the status is what the reader needs"
+
+
+def test_redact_leaves_short_strings_alone():
+    """A one-character or empty key would turn every message into asterisks;
+    an unset key is empty, and adapters are constructed with it routinely."""
+    from portfolio.retry import redact
+
+    assert redact("no key here", "") == "no key here"
+    assert redact("a fine message", "a") == "a fine message"
+    assert redact("url/v2/abcdefgh12", "abcdefgh12") == "url/v2/***"

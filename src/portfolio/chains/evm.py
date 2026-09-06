@@ -19,7 +19,7 @@ import httpx
 from eth_utils import keccak
 
 from ..models import BalanceSnapshot, Direction, Probe, Transfer
-from ..retry import Permanent, with_retry
+from ..retry import Permanent, Unavailable, redact, with_retry
 from .base import AddressState, Cursor, Target
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,15 @@ NATIVE_DECIMALS = 18
 MAX_PAGES = 5
 DISCOVER_PAGES = 20                        # ~100 tokens a page; spam runs deep
 METADATA_BATCH = 20                        # metadata calls per JSON-RPC batch
+BALANCES_BATCH = 100                       # contracts per alchemy_getTokenBalances
+CALL_BATCH = 10
+"""eth_calls per JSON-RPC batch, sized by the compute limit rather than by HTTP.
+
+Alchemy's free tier allows about 330 compute units a second and charges 26 for
+an eth_call, so a batch of fifty is four times over the line and answers 429 -
+which a catalog sweep meets immediately, because it asks hundreds of questions
+back to back with no think time between them. Ten fits; the sweep is a manual
+command, so the extra round trips cost nobody anything."""
 RATE_MARKER_DP = 4                         # decimals of the rate the marker sees
 
 
@@ -107,11 +116,19 @@ class EvmAdapter:
                 log.warning("%s: no transfer source for %s yet; skipping it", t.label, c)
         return usable
 
-    async def _rpc(self, scope: str, calls: list[tuple[str, list]]) -> list:
+    async def _rpc(self, scope: str, calls: list[tuple[str, list]],
+                   allow_errors: bool = False, attempts: int = 3,
+                   base: float = 1.0) -> list:
         """One HTTP request carrying a JSON-RPC batch.
 
         Batching is the point: a quiet tick for one address on one network costs
         a single round trip even though it asks three questions.
+
+        `allow_errors` returns None for the calls that failed instead of raising
+        on the first one. The tick wants the opposite - a probe that half worked
+        is a probe that lies - but a catalog sweep asks a dozen contracts a
+        question some of them do not answer, and one revert there is data, not
+        a failure.
         """
         net = NETWORKS[scope][0]
         payload = []
@@ -127,10 +144,18 @@ class EvmAdapter:
             r = await self._client.post(url, json=payload)
             if r.status_code in (401, 403):
                 raise Permanent(f"alchemy {r.status_code}: check ALCHEMY_API_KEY")
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Not raise_for_status(): its message carries the whole URL, and
+                # the Alchemy key is a path segment of it. This text reaches the
+                # scan result and from there a Telegram message.
+                raise RuntimeError(f"alchemy {scope}: HTTP {r.status_code}")
             return r.json()
 
-        body = await with_retry(call, what=f"alchemy {scope}")
+        try:
+            body = await with_retry(call, what=f"alchemy {scope}",
+                                    attempts=attempts, base=base)
+        except Unavailable as e:
+            raise Unavailable(redact(str(e), self._key)) from None
         if isinstance(body, dict):
             body = [body]
         by_id = {item["id"]: item for item in body}
@@ -139,8 +164,34 @@ class EvmAdapter:
             got = by_id.get(item["id"], {})
             if "error" in got:
                 msg = got["error"].get("message", "")
-                raise Permanent(f"alchemy {item['method']} on {scope}: {msg}")
+                if not allow_errors:
+                    raise Permanent(f"alchemy {item['method']} on {scope}: {msg}")
+                log.debug("%s on %s: %s", item["method"], scope, msg)
+                out.append(None)
+                continue
             out.append(got.get("result"))
+        return out
+
+    async def eth_call_many(self, scope: str, calls: list[tuple[str, str]],
+                            chunk: int = CALL_BATCH) -> list:
+        """`eth_call` a list of (to, calldata), several per round trip.
+
+        Answers line up with `calls`; a call that reverted or hit a contract
+        with no such method comes back None. Chunked because a batch of a
+        hundred is refused by the provider rather than served slowly, and a
+        catalog sweep across an Aave market reaches that size easily.
+        """
+        out: list = []
+        for i in range(0, len(calls), chunk):
+            batch = [("eth_call", [{"to": to, "data": data}, "latest"])
+                     for to, data in calls[i:i + chunk]]
+            # A sweep is the one caller that reliably meets the per-second
+            # compute limit: it asks hundreds of questions back to back with no
+            # think time between them. Waiting longer is free here - nobody is
+            # watching a manual command - and a 429 that ends the run costs the
+            # whole sweep.
+            out.extend(await self._rpc(scope, batch, allow_errors=True,
+                                       attempts=5, base=2.0))
         return out
 
     def _whitelist(self, scope: str) -> list:
@@ -170,6 +221,27 @@ class EvmAdapter:
         else:
             log.warning("%s/%s: stopped after %d pages of token balances",
                         t.label, scope, DISCOVER_PAGES)
+        return out
+
+    async def balances_of(self, scope: str, address: str,
+                          contracts: list[str]) -> dict[str, int]:
+        """Balances of named contracts, a hundred per request.
+
+        The same call `probe` uses, and the reason a catalog sweep is affordable
+        at all: asking `balanceOf` as one eth_call per token costs 26 compute
+        units each and meets the free tier's per-second limit inside one Aave
+        market, while this answers a hundred contracts in a single request.
+        """
+        out: dict[str, int] = {}
+        for i in range(0, len(contracts), BALANCES_BATCH):
+            chunk = contracts[i:i + BALANCES_BATCH]
+            (res,) = await self._rpc(scope, [("alchemy_getTokenBalances",
+                                              [address, chunk])],
+                                     attempts=5, base=2.0)
+            for entry in (res or {}).get("tokenBalances", []):
+                raw = _hex(entry.get("tokenBalance"))
+                if raw:
+                    out[entry["contractAddress"].lower()] = raw
         return out
 
     async def token_metadata(self, scope: str, contracts: list[str]) -> dict[str, dict]:

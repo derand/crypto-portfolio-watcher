@@ -346,6 +346,80 @@ def cmd_discover_tokens(args) -> int:
     return 0
 
 
+def cmd_discover_protocols(args) -> int:
+    """Propose positions the token index cannot see. Read-only, like its twin.
+
+    No price source: what this finds is a receipt token, and a receipt token is
+    listed nowhere by its own address, so there is nothing to rank by. The
+    filter here is the catalog rather than a CoinGecko listing - a contract
+    reached through a market's own enumeration cannot be an airdrop.
+    """
+    cfg = cfgmod.load(args.config, args.env)
+    if not cfg.api_keys.alchemy:
+        raise Permanent("ALCHEMY_API_KEY is not set; discovery needs it")
+
+    adapter = EvmAdapter(cfg.api_keys.alchemy, cfg.tokens_by_chain())
+
+    async def go():
+        try:
+            return await discover.collect_protocols(cfg, adapter)
+        finally:
+            await adapter.aclose()
+
+    print(discover.render_protocols(asyncio.run(go())))
+    return 0
+
+
+def cmd_catalog_check(args) -> int:
+    """Ask every catalog entry to enumerate itself, and report what answered.
+
+    A catalog address does not fail loudly when it goes stale - the market
+    simply lists nothing and the positions behind it read as absent. This is
+    the command that turns that silence into a line of output.
+    """
+    from . import catalog
+
+    cfg = cfgmod.load(args.config, args.env)
+    if not cfg.api_keys.alchemy:
+        raise Permanent("ALCHEMY_API_KEY is not set; the catalog is checked on chain")
+    from .chains.evm import NETWORKS
+
+    entries = catalog.load()
+    adapter = EvmAdapter(cfg.api_keys.alchemy)
+    # config.py allows more EVM networks than the adapter can reach, so the
+    # catalog may name one there is no provider for. That is a gap to report,
+    # not a crash on the first row.
+    reachable = {c: e for c, e in catalog.by_chain(entries).items() if c in NETWORKS}
+    unreachable = {e.chain for e in entries} - set(reachable)
+
+    async def go():
+        try:
+            return {chain: await discover._receipts(adapter, chain, on_chain)
+                    for chain, on_chain in reachable.items()}
+        finally:
+            await adapter.aclose()
+
+    found = asyncio.run(go())
+    bad = 0
+    print(f"{len(entries)} entries, "
+          f"{len({e.protocol for e in entries})} protocols, "
+          f"{len(found)} networks checked\n")
+    for entry in entries:
+        if entry.chain in unreachable:
+            print(f"  skip  {entry.label:26} no provider for {entry.chain}")
+            continue
+        tokens = found.get(entry.chain, {}).get(entry.label)
+        if tokens:
+            print(f"  ok    {entry.label:26} {len(tokens):3} receipt tokens")
+        else:
+            bad += 1
+            print(f"  STALE {entry.label:26} listed nothing - check {entry.address}")
+    if bad:
+        print(f"\n{bad} entr{'y' if bad == 1 else 'ies'} answered nothing. An entry "
+              f"that lists no tokens hides every position behind it.")
+    return 1 if bad else 0
+
+
 def cmd_telegram_chat_id(args) -> int:
     """Print chat ids the bot can currently see.
 
@@ -445,6 +519,10 @@ def main(argv=None) -> int:
     p_disc.add_argument("--show-unpriced", action="store_true",
                         help="also list holdings nothing can price; costs a metadata "
                              "call per held token, and most of them are airdrops")
+    sub.add_parser("discover-protocols",
+                   help="propose positions the token index cannot see; prints YAML")
+    sub.add_parser("catalog-check",
+                   help="ask every catalog entry to enumerate itself on chain")
     sub.add_parser("test-notify", help="send a message through every enabled channel")
     sub.add_parser("telegram-chat-id", help="find your TELEGRAM_CHAT_ID (needs the token only)")
 
@@ -453,6 +531,8 @@ def main(argv=None) -> int:
     handlers = {
         "config-check": cmd_config_check,
         "discover-tokens": cmd_discover_tokens,
+        "discover-protocols": cmd_discover_protocols,
+        "catalog-check": cmd_catalog_check,
         "init-db": cmd_init_db,
         "status": cmd_status,
         "scan": cmd_scan,

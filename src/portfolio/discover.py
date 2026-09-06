@@ -17,12 +17,15 @@ Two rules keep this from undoing the whitelist it feeds:
 import logging
 from decimal import Decimal
 
+from . import catalog
+from .chains import abi
 from .chains.base import Target
 from .chains.evm import EvmAdapter
 
 log = logging.getLogger(__name__)
 
 CG_CHUNK = 100                             # contracts per CoinGecko request
+NATIVE_DECIMALS = 18                       # every native coin on these networks
 
 
 def _targets(cfg) -> list[Target]:
@@ -149,4 +152,211 @@ def render(rows: list[dict], min_usd: float,
             tail = "  [already in config]" if r["known"] else ""
             lines.append(f"  {r['chain']:9} {r['symbol'][:20]:20} "
                          f"{r['contract']}  {amount}{tail}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Positions the token index cannot see (PLAN §6 blind spots, §14 catalog).
+# --------------------------------------------------------------------------
+
+async def _receipts(adapter: EvmAdapter, chain: str,
+                    entries: list[catalog.Entry]) -> dict[str, dict]:
+    """protocol/chain label -> {kind, tokens: [(symbol, receipt token)]}.
+
+    Two round trips for the whole network, whatever the protocol count: the
+    entry points are asked together, then the enumerations they point at are
+    asked together. Nothing here depends on an address, so the result is
+    computed once and reused for every wallet.
+    """
+    aave = [e for e in entries if e.kind == "aave_v3"]
+    comp = [e for e in entries if e.kind == "compound_v2"]
+
+    step1 = ([(e.address, abi.selector("getPoolDataProvider()")) for e in aave]
+             + [(e.address, abi.selector("getAllMarkets()")) for e in comp])
+    answers = await adapter.eth_call_many(chain, step1)
+    providers = [abi.decode_address(a) for a in answers[:len(aave)]]
+    markets = [abi.decode_address_array(a) or [] for a in answers[len(aave):]]
+
+    out: dict[str, list[tuple[str, str]]] = {}
+
+    step2 = [(p, abi.selector("getAllATokens()")) for p in providers if p]
+    listed = await adapter.eth_call_many(chain, step2) if step2 else []
+    at = 0
+    for entry, provider in zip(aave, providers):
+        if provider is None:
+            log.warning("%s: no pool data provider; catalog address may be stale",
+                        entry.label)
+            continue
+        tokens = abi.decode_symbol_address_array(listed[at]) or []
+        at += 1
+        if not tokens:
+            log.warning("%s: the market listed no receipt tokens", entry.label)
+        out[entry.label] = {"kind": entry.kind,
+                            "tokens": [(s, a.lower()) for s, a in tokens]}
+
+    for entry, found in zip(comp, markets):
+        if not found:
+            log.warning("%s: the comptroller listed no markets", entry.label)
+        # Symbols are not part of getAllMarkets(); they are asked of the few
+        # markets that turn out to hold something, rather than of all 55.
+        out[entry.label] = {"kind": entry.kind,
+                            "tokens": [("", a.lower()) for a in found]}
+    return out
+
+
+async def collect_protocols(cfg, adapter: EvmAdapter,
+                            entries: list[catalog.Entry] | None = None
+                            ) -> list[dict]:
+    """Catalog positions the watched addresses actually hold.
+
+    Cost is one balance sweep per address per network - an Aave market alone
+    lists 67 receipt tokens, so this is a manual command and never a tick.
+    """
+    entries = catalog.load() if entries is None else entries
+    per_chain = catalog.by_chain(entries)
+    targets = _targets(cfg)
+    known = {(t.chain, t.contract) for t in cfg.tokens}
+
+    # (chain, contract) -> row being built
+    rows: dict[tuple[str, str], dict] = {}
+    listings: dict[str, dict[str, dict]] = {}
+
+    for target in targets:
+        for chain in adapter.scopes(target):
+            on_chain = per_chain.get(chain)
+            if not on_chain:
+                continue
+            if chain not in listings:
+                listings[chain] = await _receipts(adapter, chain, on_chain)
+                total = sum(len(v["tokens"]) for v in listings[chain].values())
+                log.info("%s: %d receipt tokens across %d protocols",
+                         chain, total, len(listings[chain]))
+
+            flat = [(label, found["kind"], symbol, contract)
+                    for label, found in listings[chain].items()
+                    for symbol, contract in found["tokens"]]
+            held = await adapter.balances_of(chain, target.address,
+                                             [c for _, _, _, c in flat])
+
+            for label, kind, symbol, contract in flat:
+                raw = held.get(contract)
+                if not raw:
+                    continue
+                row = rows.setdefault((chain, contract), {
+                    "chain": chain, "contract": contract, "protocol": label,
+                    "kind": kind, "symbol": symbol, "holders": {},
+                    "known": (chain, contract) in known})
+                row["holders"][target.label] = raw
+            log.info("%s/%s: swept %d receipt tokens", target.label, chain, len(flat))
+
+    await _describe(adapter, rows)
+    return sorted(rows.values(), key=lambda r: (r["chain"], r["protocol"], r["symbol"]))
+
+
+async def _describe(adapter: EvmAdapter, rows: dict[tuple[str, str], dict]) -> None:
+    """Fill in symbol, decimals and the underlying, for the held ones only.
+
+    Three calls per position and none per catalog entry: whether a market has
+    fifty listings is irrelevant once the balance sweep has narrowed them to the
+    two an address actually holds.
+    """
+    by_chain: dict[str, list[dict]] = {}
+    for row in rows.values():
+        by_chain.setdefault(row["chain"], []).append(row)
+
+    for chain, group in by_chain.items():
+        calls = []
+        for row in group:
+            c = row["contract"]
+            calls += [(c, abi.selector("symbol()")),
+                      (c, abi.selector("decimals()")),
+                      # Aave names it one way, Compound another; asking both
+                      # costs a slot in a batch and saves a branch here.
+                      (c, abi.selector("UNDERLYING_ASSET_ADDRESS()")),
+                      (c, abi.selector("underlying()"))]
+        answers = await adapter.eth_call_many(chain, calls)
+        for i, row in enumerate(group):
+            symbol, decimals, aave_under, comp_under = answers[i * 4:i * 4 + 4]
+            row["symbol"] = row["symbol"] or abi.decode_string(symbol) or ""
+            row["decimals"] = abi.decode_uint(decimals)
+            row["underlying"] = (abi.decode_address(aave_under)
+                                 or abi.decode_address(comp_under))
+
+        # The underlying's own decimals are what a cToken position is measured
+        # in; the cToken's own 8 describe the share, not the money.
+        wants = [r for r in group if r.get("underlying")]
+        if wants:
+            und = await adapter.eth_call_many(
+                chain, [(r["underlying"], abi.selector("decimals()")) for r in wants])
+            for row, answer in zip(wants, und):
+                row["underlying_decimals"] = abi.decode_uint(answer)
+
+
+def _is_share(row: dict) -> bool:
+    """True for a cToken: eight decimals of share against a rate, not a balance.
+
+    An aToken rebases and reads one-to-one with the asset, so its balance is the
+    position. A cToken's balance stays put while exchangeRateStored() climbs -
+    the same shape `rate_call` was built for, with the rate scaled by 1e18.
+
+    Read from the catalog kind rather than guessed from the decimals. The guess
+    ("eight decimals over a different underlying") looks sound and then meets
+    a market for the native coin, which has no underlying() to compare against:
+    Venus's vBNB was proposed as a plain rebasing balance, which would have
+    counted eight decimals of share as if they were BNB.
+    """
+    return row.get("kind") == "compound_v2"
+
+
+def render_protocols(rows: list[dict]) -> str:
+    if not rows:
+        return ("Nothing found. The catalog covers "
+                f"{len({e.protocol for e in catalog.load()})} protocols on "
+                f"{len(catalog.by_chain())} networks; a position outside it, or "
+                "held through a contract that does not answer balanceOf, is "
+                "invisible here.")
+
+    lines = [f"{'chain':9} {'protocol':16} {'symbol':18} holders", "-" * 72]
+    for r in rows:
+        decimals = r.get("decimals")
+        who = ", ".join(
+            f"{k} {Decimal(v) / (10 ** decimals):,.6f}".rstrip("0").rstrip(".")
+            if decimals is not None else f"{k} {v} raw"
+            for k, v in r["holders"].items())
+        tail = "  [already in config]" if r["known"] else ""
+        lines.append(f"{r['chain']:9} {r['protocol'].split('/')[0]:16} "
+                     f"{(r['symbol'] or '?'):18} {who}{tail}")
+
+    fresh = [r for r in rows if not r["known"] and r.get("decimals") is not None]
+    lines.append(f"\n{len(rows)} positions found, {len(fresh)} not yet whitelisted.")
+    if not fresh:
+        return "\n".join(lines)
+
+    lines.append("\nPaste into `tokens:` what you want watched. Fill in "
+                 "coingecko_id yourself:")
+    lines.append("a receipt token is listed nowhere by its own address, so the "
+                 "id has to name")
+    lines.append("the asset it redeems for - the underlying is given beside "
+                 "each entry.\n")
+    for r in fresh:
+        share = _is_share(r)
+        # A cToken market for the native coin has no underlying() to ask; every
+        # native coin on the networks here has eighteen decimals.
+        decimals = (r.get("underlying_decimals") or NATIVE_DECIMALS) if share \
+            else r["decimals"]
+        underlying = r.get("underlying") or ("the native coin" if share else "?")
+        lines.append(f"  - chain: {r['chain']}")
+        lines.append(f'    contract: "{r["contract"]}"')
+        lines.append(f"    symbol: {r['symbol'] or '?'}")
+        lines.append(f"    decimals: {decimals}")
+        lines.append(f"    coingecko_id:        # underlying: {underlying}")
+        if share:
+            # The balance is shares; the value lives in the rate, and the rate
+            # is scaled by 1e18 whatever the underlying's own decimals are.
+            lines.append('    rate_call: "exchangeRateStored()"')
+            lines.append("    share_decimals: 18")
+        else:
+            lines.append("    yield_bearing: true")
+        lines.append(f"    # {r['protocol']}")
+        lines.append("")
     return "\n".join(lines)

@@ -1,0 +1,79 @@
+# Protocol entry points. One row per (protocol, network); the row names a
+# contract that can list the protocol's receipt tokens, never the tokens.
+#
+# Every address below was verified on chain on 2026-09-06 by making the call
+# its kind implies and checking that it answered. Add nothing here that has not
+# answered - a wrong address reports zero, which is indistinguishable from not
+# holding the position. `pw catalog-check` repeats the verification.
+#
+# kind: aave_v3     -> address is a PoolAddressesProvider
+# kind: compound_v2 -> address is a Comptroller
+
+- protocol: aave-v3
+  chain: ethereum
+  kind: aave_v3
+  address: "0x2f39d218133afab8f2b819b1066c7e434ad94e9e"
+  note: 67 aTokens at the time of writing
+
+- protocol: aave-v3
+  chain: polygon
+  kind: aave_v3
+  address: "0xa97684ead0e402dc232d5a977953df7ecbab3cdb"
+
+- protocol: aave-v3
+  chain: arbitrum
+  kind: aave_v3
+  address: "0xa97684ead0e402dc232d5a977953df7ecbab3cdb"
+
+- protocol: aave-v3
+  chain: base
+  kind: aave_v3
+  address: "0xe20fcbdbffc4dd138ce8b2e6fbb6cb49777ad64d"
+
+- protocol: aave-v3
+  chain: bsc
+  kind: aave_v3
+  address: "0xff75b6da14ffbbfd355daf7a2731456b3562ba6d"
+
+# Aave runs separate markets beside the core one; they share the interface and
+# each needs its own row, because a position in one is invisible to the other.
+- protocol: aave-v3-lido
+  chain: ethereum
+  kind: aave_v3
+  address: "0xcfbf336fe147d643b9cb705648500e101504b16d"
+
+- protocol: aave-v3-etherfi
+  chain: ethereum
+  kind: aave_v3
+  address: "0xeba440b438ad808101d1c451c1c5322c90befcda"
+
+- protocol: spark
+  chain: ethereum
+  kind: aave_v3
+  address: "0x02c3ea4e34c0cbd694d2adfa2c690eecbc1793ee"
+
+- protocol: seamless
+  chain: base
+  kind: aave_v3
+  address: "0x0e02eb705be325407707662c6f6d3466e939f3a0"
+
+- protocol: zerolend
+  chain: ethereum
+  kind: aave_v3
+  address: "0xfd856e1a33225b86f70d686f9280435e3ff75fcf"
+
+- protocol: venus
+  chain: bsc
+  kind: compound_v2
+  address: "0xfd36e2c2a6789db23113685031d7f16329158384"
+  note: 55 markets; exchangeRateStored() returns a tuple on this fork
+
+- protocol: moonwell
+  chain: base
+  kind: compound_v2
+  address: "0xfbb21d0380bee3312b33c4353c8936a0f13ef26c"
+
+- protocol: compound-v2
+  chain: ethereum
+  kind: compound_v2
+  address: "0x3d9819210a31b4961b30ef54be2aed79b9c9cd3b"

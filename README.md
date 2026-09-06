@@ -28,6 +28,8 @@ cp config/portfolio.example.yaml config/portfolio.yaml   # fill in your own addr
 ./pw digest           # the daily summary (--dry-run to only look at it)
 ./pw status           # what the database currently holds
 ./pw discover-tokens  # propose tokens for the whitelist (never writes the config)
+./pw discover-protocols # propose positions the token index cannot see
+./pw catalog-check    # ask every catalog entry to enumerate itself on chain
                       # --show-unpriced: also what there is no price for
 ./pw telegram-chat-id # find your TELEGRAM_CHAT_ID (needs the token only)
 ```
@@ -89,6 +91,7 @@ No test touches the network.
 | `src/portfolio/protocols/`| Hyperliquid, beacon (validators)                 |
 | `src/portfolio/notify/`   | Telegram, later ntfy and Discord                 |
 | `src/portfolio/discover.py`| whitelist candidates, run by hand               |
+| `src/portfolio/catalog/`  | protocol entry points; data, polled by no tick   |
 | `Dockerfile`, `docker-compose.yml` | running in a container (rpi42)          |
 | `requirements.txt`        | image dependencies; the venv installs nothing    |
 

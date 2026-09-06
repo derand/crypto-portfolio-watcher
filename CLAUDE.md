@@ -20,6 +20,8 @@ nothing. Adding a dependency is a decision to raise with the user, not a step.
 ./pw portfolio               # what is held now, at today's prices (--send to deliver)
 ./pw digest --dry-run        # daily summary without sending or recording
 ./pw discover-tokens         # propose whitelist candidates (--show-unpriced, --min-usd)
+./pw discover-protocols      # propose positions the token index cannot see
+./pw catalog-check           # verify every catalog entry still enumerates
 ./pw bot                     # answer Telegram commands only, no scan loop
 ./pw -v scan                 # verbose; the flag goes BEFORE the subcommand
 
@@ -70,6 +72,18 @@ tick silently turns a cheap watcher into an expensive one — see the rate-round
 
 Registration is one line in `chains/__init__.py::build_adapters` or
 `protocols/__init__.py::build_sources`.
+
+**`catalog/` is data, and no tick reads it.** It names one contract per (protocol, network)
+that can list that protocol's receipt tokens — an Aave `PoolAddressesProvider`, a Compound
+`Comptroller` — so `discover-protocols` can sweep them and propose `tokens:` entries for
+what an address actually holds. Storing the market rather than its tokens is the whole
+trick: one row stays right through every listing a market adds later. Two rules: **every
+address is verified on chain before it is added** (a wrong one reports zero, which reads
+exactly like holding nothing — `catalog-check` re-runs the verification), and the file
+states which protocols a reader can *ask*, never which are held. A sweep uses
+`alchemy_getTokenBalances` with an explicit contract list, not one `eth_call` per token:
+at 26 compute units each, a single Aave market's 67 tokens exceed the free tier's 330 CU
+per second and the run dies on 429.
 
 **Commands are the same code, read-only** (`bot.py`). `watch` runs the tick loop and a
 Telegram long-poll loop as two asyncio tasks in one process; `/portfolio` and `/digest`
