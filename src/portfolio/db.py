@@ -13,7 +13,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS events (
     ts            TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'confirmed',
     detail        TEXT,
+    pnl_usd       REAL,                   -- realised, and only where the venue reports it
     UNIQUE(chain, address_id, kind, uid)
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
@@ -210,7 +211,19 @@ def _v3_to_v4(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
 
 
-MIGRATIONS = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4}
+def _v4_to_v5(conn: sqlite3.Connection) -> None:
+    """`events.pnl_usd`: what a closed trade actually made.
+
+    Separate from `usd`, which everywhere else means "what the thing that moved
+    was worth". A closed perp moves a notional and realises a profit, and the
+    two are different numbers - summing one column that sometimes holds each
+    would produce a figure that means nothing. NULL is the normal state: it says
+    the venue did not tell us, and nothing downstream may invent a number for it.
+    """
+    conn.execute("ALTER TABLE events ADD COLUMN pnl_usd REAL")
+
+
+MIGRATIONS = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4, 4: _v4_to_v5}
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default=None):

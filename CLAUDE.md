@@ -73,6 +73,9 @@ tick silently turns a cheap watcher into an expensive one — see the rate-round
   Bitcoin uses the empty scope; EVM uses the network name.
 - `protocols/base.py::PositionSource` — `fetch()` returning positions plus an opaque
   marker. Selected by the address's `watch` list; `name` must match the watch keyword.
+  One optional method: `trades()`, for a venue that can say what a position *made*. It is
+  asked only on a tick where a position shrank, vanished or flipped, never on every tick,
+  and a source without it loses nothing.
 
 Registration is one line in `chains/__init__.py::build_adapters` or
 `protocols/__init__.py::build_sources`.
@@ -143,6 +146,16 @@ the digest looked like before, and PLAN §9 records the fix.
 balance (`hold` == `marginUsed`), so `accountValue` is margin already counted plus PnL:
 the total takes spot balances and each perp's unrealised PnL, never `accountValue` and
 never a notional. PLAN §6 has the measurements.
+
+**A closed position reports the exchange's realised figure, or no figure at all.**
+`events.pnl_usd` is filled from the venue's own fills (`trades()`), summed across the
+pieces one order is filled in, and it is what the digest totals for the day. The stored
+snapshot's *unrealised* PnL is never used for this: it is up to one interval old and
+stalest exactly when a position closes, because the price moving is usually why it closed.
+So an unanswerable close says what closed and nothing about money, and `pnl_usd` stays
+NULL — which is also why the digest splits on `IS NOT NULL` rather than on a zero. The
+figure covers only trades whose position was in the database: one opened and closed inside
+a single interval is invisible, and no sum taken from the database can include it.
 
 **Money is always an integer** in base units (`amount_raw` + `decimals`). Floats appear
 only in USD figures used for display and thresholds. A float creeping into an amount is a

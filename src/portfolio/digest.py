@@ -51,7 +51,7 @@ def collect(conn, prices=None) -> dict:
 
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     recent = _rows(conn, """
-        SELECT e.kind, e.direction, e.amount_raw, e.usd, e.detail, e.ts,
+        SELECT e.kind, e.direction, e.amount_raw, e.usd, e.pnl_usd, e.detail, e.ts,
                a.label, s.symbol, s.decimals
         FROM events e JOIN addresses a ON a.id = e.address_id
         LEFT JOIN assets s ON s.id = e.asset_id
@@ -469,6 +469,12 @@ def _last24h(recent: list[dict], width: int = TABLE_WIDTH) -> tuple[str, list[st
     transfers = [e for e in recent if e["kind"] == EventKind.TRANSFER.value]
     accruals = [e for e in recent if e["kind"] == EventKind.ACCRUAL.value]
     changes = [e for e in recent if e["kind"] == EventKind.POSITION_CHANGE.value]
+    # A position change that came back with a realised figure is a trade, and
+    # counting it in both places would say "2 position changes, 2 trades" about
+    # two events. `pnl_usd` is NULL everywhere else, including on a close whose
+    # venue could not be asked - so the split is on knowing, not on guessing.
+    trades = [e for e in changes if e.get("pnl_usd") is not None]
+    changes = [e for e in changes if e.get("pnl_usd") is None]
     anomalies = [e for e in recent if e["kind"] == EventKind.ANOMALY.value]
 
     parts = []
@@ -497,6 +503,12 @@ def _last24h(recent: list[dict], width: int = TABLE_WIDTH) -> tuple[str, list[st
     earned = {k: v for k, v in totals.items() if v[0] > 0}
     if earned:
         parts.append(f"yield in {len(earned)} asset{'s' if len(earned) > 1 else ''}")
+    if trades:
+        # "closed", not "day pnl": these are the trades this watcher saw close.
+        # A position opened and closed inside one interval never reached the
+        # database, and no sum taken from the database can include it.
+        pnl = sum(e["pnl_usd"] or 0 for e in trades)
+        parts.append(f"{len(trades)} closed, pnl ${pnl:+,.2f}")
     if changes:
         parts.append(f"{len(changes)} position change{'s' if len(changes) > 1 else ''}")
     if anomalies:

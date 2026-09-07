@@ -174,3 +174,27 @@ def test_notifications_still_work_after_migrating(tmp_path):
     sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE name='notifications'").fetchone()[0]
     assert "events_v1" not in sql
+
+
+def test_a_v4_database_gains_the_realised_pnl_column(tmp_path):
+    """The column arrives on an existing database with its events intact - and
+    every one of them keeps NULL, which is exactly right: nothing recorded
+    before this existed has a realised figure, and none may be invented."""
+    cfg, conn = make(tmp_path)
+    dbmod.sync_config(conn, cfg)
+    conn.executescript("""
+        ALTER TABLE events DROP COLUMN pnl_usd;
+        UPDATE schema_version SET version=4;
+    """)
+    aid = conn.execute("SELECT id FROM addresses LIMIT 1").fetchone()[0]
+    conn.execute("""INSERT INTO events(chain, address_id, uid, kind, ts, detail)
+                    VALUES ('hyperliquid', ?, 'perp:ETH:closed:1', 'position_change',
+                            '2026-09-06T00:00:00Z', 'closed perp:ETH (1.5)')""", (aid,))
+
+    dbmod.init(conn)
+
+    assert conn.execute(
+        "SELECT version FROM schema_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+    row = conn.execute("SELECT detail, pnl_usd FROM events").fetchone()
+    assert row["detail"] == "closed perp:ETH (1.5)"
+    assert row["pnl_usd"] is None

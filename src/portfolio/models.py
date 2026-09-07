@@ -154,6 +154,26 @@ class Position:
 
 
 @dataclass(slots=True)
+class Trade:
+    """What a venue reports about a position that was closed or cut down.
+
+    Built from the venue's own fills, never from our last snapshot: the snapshot
+    is up to one interval old, and a position is usually closed *because* the
+    price moved, so the stale number is worst exactly when it matters most. A
+    venue that cannot answer produces no Trade at all, and the event then says
+    what closed without saying what it made - which is the honest report.
+    """
+    pnl_usd: float
+    """Realised, as the venue computes it. Fees are `fee_usd`, not deducted
+    here, and funding paid while the position was open is in neither."""
+    exit_px: str = ""
+    fee_usd: float | None = None
+    liquidated: bool = False
+    """The position was closed by the exchange rather than by its owner. Worth
+    its own word in the alert: the number alone does not say who decided."""
+
+
+@dataclass(slots=True)
 class Block:
     """One section of a Message, as a table the channel may lay out itself.
 

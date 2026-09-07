@@ -553,3 +553,36 @@ def test_a_debt_is_never_folded_away_as_small_change():
     body = "\n".join(lines)
     assert "variableDebt" in body or "-5" in body, "the loan earns its own row"
     assert "+1 under $1" in body, "only the forty cents is dust"
+
+
+def _trade(pnl, detail="closed long 1.5 ETH @ 3,100   pnl +12.50"):
+    row = _event("position_change", "ETH", 150000000, "hl-1", detail=detail, decimals=8)
+    row["pnl_usd"] = pnl
+    return row
+
+
+def test_the_day_says_what_the_closed_trades_made():
+    """The per-trade alerts went out hours ago and are scrolled past by morning.
+    The one line that is read at 9am is where the day's result belongs."""
+    summary, _ = digest._last24h([_trade(12.5), _trade(-4.4)])
+    assert "2 closed, pnl $+8.10" in summary
+
+
+def test_a_closed_trade_is_not_also_counted_as_a_position_change():
+    """Both are the same row. Counting it twice would say "1 position change,
+    1 closed" about one event and make the day look busier than it was."""
+    summary, _ = digest._last24h([_trade(12.5)])
+    assert "position change" not in summary
+
+    both = digest._last24h([_trade(12.5), _event("position_change", "ETH", 1, "hl-1")])[0]
+    assert "1 closed" in both and "1 position change" in both
+
+
+def test_a_close_with_no_realised_figure_stays_a_position_change():
+    """NULL means the venue was not asked or could not answer. Reading it as a
+    zero-profit trade would put a made-up number into the day's total."""
+    row = _event("position_change", "ETH", 150000000, "hl-1", detail="closed perp:ETH")
+    row["pnl_usd"] = None
+    summary, _ = digest._last24h([row])
+    assert "closed, pnl" not in summary
+    assert "1 position change" in summary

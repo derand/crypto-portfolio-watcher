@@ -162,3 +162,94 @@ async def test_a_spot_balance_carries_the_venues_token_index():
     spot = {p.key: p for p in positions if p.key.startswith("spot:")}
     assert spot["spot:UBTC"].contract == "1"
     assert spot["spot:USDC"].contract == "0"
+
+
+def fills_source(fills):
+    """A source whose only answer is a userFillsByTime response."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json=fills)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return HyperliquidSource(url="http://hl/info", client=client), seen
+
+
+def fill(coin="ETH", dir="Close Long", pnl="12.5", sz="1.5", px="3100.0",
+         fee="0.62", token="USDC", **extra):
+    return {"coin": coin, "dir": dir, "closedPnl": pnl, "sz": sz, "px": px,
+            "fee": fee, "feeToken": token, "time": 1788394273681,
+            "hash": "0xabc", "oid": 1, "tid": 2, "side": "A", **extra}
+
+
+async def test_a_close_reports_the_exchanges_own_realised_pnl():
+    """The alternative was our last snapshot's unrealised PnL, which is up to an
+    interval old and stalest exactly when a position closes - the price moving
+    is usually why it closed."""
+    src, seen = fills_source([fill()])
+    trades = await src.trades(TARGET, since_ms=1788394000000)
+
+    assert list(trades) == ["perp:ETH"]
+    assert trades["perp:ETH"].pnl_usd == 12.5
+    assert trades["perp:ETH"].fee_usd == 0.62
+    assert not trades["perp:ETH"].liquidated
+    assert seen[0]["type"] == "userFillsByTime"
+    assert seen[0]["startTime"] == 1788394000000, \
+        "a fill from before the last scan belongs to a close already reported"
+
+
+async def test_one_close_filled_in_pieces_is_one_trade():
+    """An order is filled in as many pieces as the book requires. Three fills of
+    the same close are one trade, and its exit price is the price it got out at -
+    weighted by size, not the average of the prices."""
+    src, _ = fills_source([fill(sz="1.0", px="3000.0", pnl="10.0", fee="0.30"),
+                           fill(sz="3.0", px="3100.0", pnl="30.0", fee="0.90")])
+    trade = (await src.trades(TARGET))["perp:ETH"]
+
+    assert trade.pnl_usd == 40.0
+    assert trade.fee_usd == 1.2
+    assert float(trade.exit_px) == 3075.0
+
+
+async def test_an_opening_fill_closes_nothing_and_is_ignored():
+    """Every fill in the window comes back, opens included. Counting one would
+    invent a trade out of somebody starting a position."""
+    src, _ = fills_source([fill(coin="BTC", dir="Open Long", pnl="0.0"),
+                           fill(coin="ETH")])
+    assert list(await src.trades(TARGET)) == ["perp:ETH"]
+
+
+async def test_a_flip_realises_the_old_position_without_saying_close():
+    """Long to short is one fill, dir "Long > Short", and it closes the whole old
+    position. Matching only on the word "close" would lose it."""
+    src, _ = fills_source([fill(dir="Long > Short", pnl="-8.25")])
+    assert (await src.trades(TARGET))["perp:ETH"].pnl_usd == -8.25
+
+
+async def test_a_liquidation_is_marked_as_one():
+    """Who closed the position is not in the number. It is the part worth seeing
+    first, so it has to survive the parse."""
+    src, _ = fills_source([fill(dir="Close Long", pnl="-120.0",
+                                liquidation={"liquidatedUser": "0x0"})])
+    assert (await src.trades(TARGET))["perp:ETH"].liquidated
+
+    src, _ = fills_source([fill(dir="Liquidated Long", pnl="-120.0")])
+    assert (await src.trades(TARGET))["perp:ETH"].liquidated
+
+
+async def test_a_fee_paid_in_something_else_is_not_counted_as_dollars():
+    """Adding a quantity of HYPE to a dollar figure is arithmetic on two
+    different units. Better no fee than a wrong one."""
+    src, _ = fills_source([fill(fee="3.0", token="HYPE")])
+    trade = (await src.trades(TARGET))["perp:ETH"]
+    assert trade.fee_usd is None
+    assert trade.pnl_usd == 12.5, "the profit is still known"
+
+
+async def test_a_window_with_no_fills_reports_no_trades():
+    """The position closed on the exchange's side of a boundary, or the venue
+    simply has nothing. Neither is an error, and neither may become a number."""
+    src, _ = fills_source([])
+    assert await src.trades(TARGET) == {}

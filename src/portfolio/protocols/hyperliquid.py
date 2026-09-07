@@ -21,7 +21,7 @@ from decimal import Decimal, InvalidOperation
 import httpx
 
 from ..chains.base import Target
-from ..models import Position
+from ..models import Position, Trade
 from ..retry import with_retry
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class HyperliquidSource:
             await self._client.aclose()
             self._client = None
 
-    async def _info(self, body: dict) -> dict:
+    async def _info(self, body: dict):
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=20.0)
 
@@ -89,6 +89,25 @@ class HyperliquidSource:
         marker = "|".join(f"{p.key}={p.amount_raw}"
                           for p in positions if p.key != "account")
         return positions, marker
+
+    async def trades(self, t: Target, since_ms: int | None = None) -> dict[str, Trade]:
+        """What the positions that just closed or shrank actually made.
+
+        Asked only on a tick where one of them did, so this is not part of the
+        per-tick cost. `closedPnl` is the exchange's own realised figure - the
+        alternative was our last snapshot's unrealised PnL, which is up to one
+        interval old and stalest exactly when a position closes, because the
+        price moving is usually why it closed.
+
+        The window starts at the previous successful scan, with no margin
+        subtracted. A fill from before it belongs to a close we have already
+        reported, and counting it twice would put a wrong number in a message;
+        losing one at the boundary only leaves the message without a number,
+        which the caller is built to handle.
+        """
+        body = {"type": "userFillsByTime", "user": t.address,
+                "startTime": int(since_ms or 0), "aggregateByTime": True}
+        return _closes(await self._info(body))
 
     @staticmethod
     def _account(state: dict) -> list[Position]:
@@ -180,6 +199,73 @@ class HyperliquidSource:
                 amount_raw=_scaled(amount), decimals=SCALE,
                 asset_key=f"hyperliquid:{STAKE_SYMBOL}", extra=extra))
         return out
+
+
+def _realised(fill: dict) -> Decimal | None:
+    """The PnL this fill closed, or None if it closed nothing.
+
+    Three signals, because one is not enough. `dir` says what the fill did in
+    words ("Close Long", and "Long > Short" for a flip, which realises the whole
+    old position without the word "close" appearing anywhere). A non-zero
+    `closedPnl` says the same thing in numbers. A liquidation says it a third
+    way. An opening fill fails all three.
+    """
+    pnl = _dec(fill.get("closedPnl"))
+    direction = str(fill.get("dir") or "").lower()
+    if "close" in direction or ">" in direction or pnl != 0 or _liquidated(fill):
+        return pnl
+    return None
+
+
+def _liquidated(fill: dict) -> bool:
+    """Whether the exchange, rather than the owner, closed this.
+
+    Two spellings because the API has used both: a `liquidation` object on the
+    fill, and the word inside `dir`. Reading neither costs a wrong alert, not a
+    crash, so both are checked and neither is required.
+    """
+    return bool(fill.get("liquidation")) or "liquidat" in str(fill.get("dir") or "").lower()
+
+
+def _closes(fills) -> dict[str, Trade]:
+    """Fills to one Trade per coin, keyed like the position it belongs to.
+
+    Summed rather than taken one by one: an order is filled in as many pieces as
+    the book requires, and three fills of the same close are one trade. The exit
+    price is weighted by size for the same reason - the average of the prices is
+    not the price it got out at.
+    """
+    totals: dict[str, dict] = {}
+    for fill in fills or []:
+        coin = fill.get("coin")
+        pnl = _realised(fill) if coin else None
+        if pnl is None:
+            continue
+        size = abs(_dec(fill.get("sz")))
+        entry = totals.setdefault(coin, {"pnl": Decimal(0), "fee": Decimal(0),
+                                         "size": Decimal(0), "notional": Decimal(0),
+                                         "liquidated": False, "priced": True})
+        entry["pnl"] += pnl
+        entry["size"] += size
+        entry["notional"] += size * _dec(fill.get("px"))
+        entry["liquidated"] = entry["liquidated"] or _liquidated(fill)
+        # A fee paid in something other than USDC is a quantity of that thing,
+        # and adding it to dollars would be arithmetic on two different units.
+        token = str(fill.get("feeToken") or "USDC").upper()
+        if token in ("USDC", "USD"):
+            entry["fee"] += _dec(fill.get("fee"))
+        else:
+            entry["priced"] = False
+
+    out = {}
+    for coin, t in totals.items():
+        px = t["notional"] / t["size"] if t["size"] else Decimal(0)
+        out[f"perp:{coin}"] = Trade(
+            pnl_usd=float(t["pnl"]),
+            exit_px=str(px) if t["size"] else "",
+            fee_usd=float(t["fee"]) if t["priced"] else None,
+            liquidated=t["liquidated"])
+    return out
 
 
 def _liq_distance(mark: Decimal, liq: Decimal | None) -> Decimal | None:

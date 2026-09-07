@@ -5,7 +5,7 @@ from portfolio import db as dbmod
 from portfolio import pipeline
 from portfolio.chains.base import AddressState, Cursor, Target
 from portfolio.models import (BalanceSnapshot, Direction, Position, Probe,
-                              Transfer)
+                              Trade, Transfer)
 
 A1 = "bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97"
 A2 = "bc1q9qkjc8x853msxzsykp5qc5hjc0uav8ak4wwj5q"
@@ -343,6 +343,26 @@ class FakeSource:
         return list(snapshot), marker
 
 
+class TradingSource(FakeSource):
+    """A source that can also say what a closed position made.
+
+    Separate from FakeSource on purpose: the hook is optional, and the tests
+    that use the plain source are what prove a venue without one still works.
+    """
+
+    def __init__(self, script, trades=None, blow_up=False):
+        super().__init__(script)
+        self._trades = trades or {}
+        self._blow_up = blow_up
+        self.asked: list = []
+
+    async def trades(self, t, since_ms=None):
+        self.asked.append(since_ms)
+        if self._blow_up:
+            raise RuntimeError("hyperliquid userFillsByTime 500")
+        return self._trades
+
+
 HL_CFG = """
 db_path: {db}
 notify:
@@ -411,7 +431,16 @@ async def test_opening_a_position_alerts_with_its_terms(tmp_path):
     await run_hl(cfg, conn, router, src)
     body = router.sent[0].body
     assert "opened long 1.5 ETH" in body
-    assert "20x" in body and "liq 2,400.00" in body
+    assert "20x" in body and "liq 2,400" in body
+
+
+async def test_a_cheap_coins_price_is_not_rounded_into_uselessness(tmp_path):
+    """Two decimals is plenty of bitcoin and hides more than a percent of a coin
+    trading at $0.81 - and a percent is the whole trade. The digits kept follow
+    the size of the number."""
+    assert pipeline._px("71408.1953557468") == "71,408.2"
+    assert pipeline._px("0.81107142") == "0.811071"
+    assert pipeline._px("2400.0") == "2,400"
 
 
 async def test_resizing_and_closing_a_position_each_alert_once(tmp_path):
@@ -902,3 +931,133 @@ async def test_the_drifting_amount_of_a_range_position_stays_silent(tmp_path):
     kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events")]
     assert kinds and set(kinds) == {"accrual"}
     assert router.sent == []
+
+
+def closed_trade(**kw):
+    fields = {"pnl_usd": 12.5, "exit_px": "3100.0", "fee_usd": 0.62}
+    fields.update(kw)
+    return {"perp:ETH": Trade(**fields)}
+
+
+def pnl_column(conn):
+    return [r[0] for r in conn.execute(
+        "SELECT pnl_usd FROM events WHERE kind='position_change' ORDER BY id")]
+
+
+async def test_a_closed_perp_says_what_it_made(tmp_path):
+    """The line a trade leaves behind is the one that gets read. Without the
+    figure it says a position vanished, which is the half of the news nobody
+    needed telling."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp()], [account()]], closed_trade())
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    body = router.sent[0].body
+    assert "closed long 1.5 ETH" in body
+    assert "@ 3,100" in body and "pnl +12.50" in body and "fee 0.62" in body
+    assert pnl_column(conn) == [12.5]
+
+
+async def test_a_close_the_venue_cannot_explain_reports_no_number(tmp_path):
+    """The stored snapshot has an unrealised PnL sitting right there, and using
+    it would be wrong by however far the price moved while nobody was looking.
+    Silence about the money is the honest answer, and NULL is what keeps the
+    digest from summing a guess."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp()], [account()]], trades={})
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    body = router.sent[0].body
+    assert "closed perp:ETH" in body
+    assert "pnl" not in body
+    assert pnl_column(conn) == [None]
+
+
+async def test_the_venue_is_asked_only_when_something_closed(tmp_path):
+    """It is a request. A tick where a position merely grew must not pay for it -
+    the same bargain the cheap probe makes."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp(size=150000000)],
+                         [account(), perp(size=250000000)],
+                         [account()]], closed_trade())
+    router = FakeRouter()
+    for _ in range(3):
+        await run_hl(cfg, conn, router, src)
+
+    assert len(src.asked) == 1, "asked on the close, and only on the close"
+    assert src.asked[0] is not None, "the window starts at the last scan"
+
+
+async def test_a_position_cut_in_half_carries_its_pnl(tmp_path):
+    """Half a position closed is a trade with a realised result. Reporting only
+    full closes would leave `2.5 → 1.25` as a line about nothing."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp(size=250000000)],
+                         [account(), perp(size=125000000)]],
+                        closed_trade(pnl_usd=6.1, fee_usd=None))
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    body = router.sent[0].body
+    assert "2.5 → 1.25" in body and "pnl +6.10" in body
+    assert pnl_column(conn) == [6.1]
+
+
+async def test_a_flip_is_asked_about_even_though_it_grew(tmp_path):
+    """Long 1.5 to short 2.0 realises the whole old position while the key never
+    disappears and the size goes up. Sizing the change alone would miss it."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp(size=150000000)],
+                         [account(), perp(size=-200000000, side="short")]],
+                        closed_trade(pnl_usd=-8.25))
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    assert len(src.asked) == 1
+    assert "pnl -8.25" in router.sent[0].body
+
+
+async def test_a_liquidation_is_named_rather_than_left_to_the_minus_sign(tmp_path):
+    """A loss says how much; only the word says who decided."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp()], [account()]],
+                        closed_trade(pnl_usd=-120.0, liquidated=True))
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    body = router.sent[0].body
+    assert "liquidated long 1.5 ETH" in body and "pnl -120.00" in body
+
+
+async def test_a_venue_that_fails_to_explain_still_delivers_the_alert(tmp_path):
+    """The position closed either way. Losing the alert because the second
+    request failed would trade the news for the footnote."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp()], [account()]], blow_up=True)
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    result = await run_hl(cfg, conn, router, src)
+
+    assert "closed perp:ETH" in router.sent[0].body
+    assert pnl_column(conn) == [None]
+    assert result.failed == [], "an unexplained close is not a failed scan"
+
+
+async def test_a_source_without_the_hook_is_never_asked(tmp_path):
+    """`trades` is optional. Every other position source - validators, range
+    positions - has no fills to offer and must not be expected to."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), perp()], [account()]])
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)
+    await run_hl(cfg, conn, router, src)
+
+    assert "closed perp:ETH" in router.sent[0].body
+    assert pnl_column(conn) == [None]

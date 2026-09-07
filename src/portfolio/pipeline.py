@@ -501,7 +501,8 @@ def _upsert_position(conn, address_id: int, p, asset_id: int | None) -> None:
 
 
 def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
-                    amount_raw: int, kind: str = EventKind.POSITION_CHANGE.value) -> int | None:
+                    amount_raw: int, kind: str = EventKind.POSITION_CHANGE.value,
+                    pnl_usd: float | None = None) -> int | None:
     """Insert one position event; None if it was already recorded.
 
     The uid carries the new state, so an unchanged position produces the same
@@ -514,9 +515,9 @@ def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
         return None
     cur = conn.execute(
         """INSERT INTO events(chain, scope, address_id, tx_hash, uid, kind,
-                              amount_raw, ts, status, detail)
-           VALUES (?,'',?,'',?,?,?,?, 'confirmed', ?)""",
-        (chain, address_id, uid, kind, str(amount_raw), _now(), detail))
+                              amount_raw, ts, status, detail, pnl_usd)
+           VALUES (?,'',?,'',?,?,?,?, 'confirmed', ?, ?)""",
+        (chain, address_id, uid, kind, str(amount_raw), _now(), detail, pnl_usd))
     return cur.lastrowid
 
 
@@ -554,13 +555,20 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
     res.changed += 1
     baseline = cursor.is_fresh
 
+    previous = {r["position_key"]: r for r in conn.execute(
+        """SELECT p.position_key, p.amount_raw, p.extra, s.decimals, s.symbol
+             FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
+            WHERE p.address_id=? AND p.protocol=?""",
+        (address_id, source.name))}
+    # Deliberately outside the transaction below: this asks the venue over the
+    # network, and a transaction held open across a request is a lock held for
+    # as long as the provider feels like taking.
+    trades = ({} if baseline else
+              await _closed_trades(conn, source, target, chain, address_id,
+                                   previous, positions))
+
     conn.execute("BEGIN")
     try:
-        previous = {r["position_key"]: r for r in conn.execute(
-            """SELECT p.position_key, p.amount_raw, p.extra, s.decimals
-                 FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
-                WHERE p.address_id=? AND p.protocol=?""",
-            (address_id, source.name))}
         seen = set()
 
         for p in positions:
@@ -602,10 +610,11 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                         conn, chain, address_id, f"{p.key}:{p.amount_raw}",
                         _opened_text(p), p.amount_raw)
                 elif before != p.amount_raw:
+                    trade = trades.get(p.key)
                     eid = _position_event(
                         conn, chain, address_id, f"{p.key}:{p.amount_raw}",
-                        f"{p.key} {_fmt(before, p.decimals)} → "
-                        f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}", p.amount_raw)
+                        _changed_text(p, before) + _trade_tail(trade), p.amount_raw,
+                        pnl_usd=trade.pnl_usd if trade else None)
                 if eid:
                     res.new_events += 1
                     # The same threshold transfers get. A Hyperliquid spot
@@ -633,9 +642,10 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
             # row["decimals"] rather than a literal 8: it happens to be right
             # for Bitcoin and for Hyperliquid's scale, and wrong by ten orders
             # of magnitude for an exited 18-decimal validator.
+            trade = trades.get(key)
             eid = _position_event(conn, chain, address_id, f"{key}:closed:{before}",
-                                  f"closed {key} ({_fmt(before, row['decimals'] or 8)})",
-                                  before)
+                                  _closed_text(key, before, row, trade), before,
+                                  pnl_usd=trade.pnl_usd if trade else None)
             if eid:
                 res.new_events += 1
                 _queue(conn, eid, channels)
@@ -665,11 +675,124 @@ def _opened_text(p) -> str:
 
 
 def _px(text: str) -> str:
-    """Trim exchange price strings: 71408.1953557468 tells nobody anything."""
+    """Trim exchange price strings: 71408.1953557468 tells nobody anything.
+
+    How much to trim depends on the coin. Two decimals is plenty of bitcoin and
+    is useless for a coin that trades at $0.81, where it hides more than a
+    percent - and a percent is the whole trade.
+    """
     try:
-        return f"{float(text):,.2f}"
+        value = float(text)
     except (TypeError, ValueError):
         return str(text)
+    size = abs(value)
+    places = 2 if size >= 100 else 4 if size >= 1 else 6
+    out = f"{value:,.{places}f}"
+    return out.rstrip("0").rstrip(".") if "." in out else out
+
+
+def _changed_text(p, before: int) -> str:
+    return (f"{p.key} {_fmt(before, p.decimals)} → "
+            f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}")
+
+
+def _closed_text(key: str, before: int, row, trade) -> str:
+    """The line a closed position leaves behind.
+
+    With a Trade it mirrors `_opened_text`, so the two ends of the same position
+    read as a pair. Without one it says only what it knows - what closed and how
+    big it was. That is the whole point of the venue's fills being optional:
+    a close whose result we cannot look up gets no number rather than a number
+    from the last snapshot, which would be wrong by however far the price moved
+    while nobody was looking.
+    """
+    decimals = row["decimals"] or 8
+    plain = f"closed {key} ({_fmt(before, decimals)})"
+    if trade is None:
+        return plain
+    extra = _extra(row)
+    side = extra.get("side", "")
+    symbol = row["symbol"] or key.split(":")[-1]
+    verb = "liquidated" if trade.liquidated else "closed"
+    bits = [verb, side, _fmt(abs(before), decimals), symbol]
+    if trade.exit_px:
+        bits.append(f"@ {_px(trade.exit_px)}")
+    return " ".join(b for b in bits if b) + _trade_tail(trade, exit_px=False)
+
+
+def _trade_tail(trade, exit_px: bool = True) -> str:
+    """The numbers a Trade adds to a line, in the order they are read.
+
+    The profit first, because it is the question; the fee after it, because it
+    is not deducted from it. Nothing at all when there is no Trade - an empty
+    string here is what keeps every other position source's text unchanged.
+    """
+    if trade is None:
+        return ""
+    parts = []
+    if exit_px and trade.exit_px:
+        parts.append(f"@ {_px(trade.exit_px)}")
+    parts.append(f"pnl {trade.pnl_usd:+,.2f}")
+    if trade.fee_usd:
+        parts.append(f"fee {trade.fee_usd:,.2f}")
+    if exit_px and trade.liquidated:
+        # The close branch says it in the verb; a reduce has no verb to say it in.
+        parts.append("(liquidation)")
+    return "   " + "   ".join(parts)
+
+
+def _extra(row) -> dict:
+    try:
+        return json.loads(row["extra"] or "{}")
+    except (ValueError, TypeError):
+        return {}
+
+
+async def _closed_trades(conn, source, target, chain: str, address_id: int,
+                         previous: dict, positions: list) -> dict:
+    """Ask the venue what the positions that just shrank or vanished made.
+
+    Only when one did: this is a request, and a tick where nothing closed must
+    not pay for it - that is the same bargain the cheap probe makes. A source
+    with nothing to say is the normal case, and a source that fails to answer
+    costs the message its numbers and nothing else.
+    """
+    ask = getattr(source, "trades", None)
+    if ask is None:
+        return {}
+    now = {p.key: p.amount_raw for p in positions}
+    closed = [
+        key for key, row in previous.items()
+        if key != "account" and (
+            key not in now
+            or abs(now[key]) < abs(int(row["amount_raw"]))
+            # A flip realises the whole old position while the key never
+            # disappears and the size may even grow: long 112 to short 200.
+            or now[key] * int(row["amount_raw"]) < 0)]
+    if not closed:
+        return {}
+    try:
+        return await ask(target, _since_ms(conn, chain, address_id)) or {}
+    except Exception as e:                           # noqa: BLE001
+        log.warning("%s/%s: closed %s, but no trade detail (%s)",
+                    target.label, chain, ", ".join(sorted(closed)), e)
+        return {}
+
+
+def _since_ms(conn, chain: str, address_id: int) -> int | None:
+    """When this address was last scanned, in the milliseconds venues speak."""
+    row = conn.execute(
+        "SELECT last_ok_at FROM cursors WHERE chain=? AND address_id=? AND scope=''",
+        (chain, address_id)).fetchone()
+    if not row or not row["last_ok_at"]:
+        return None
+    try:
+        when = datetime.fromisoformat(row["last_ok_at"])
+    except (ValueError, TypeError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return int(when.timestamp() * 1000)
 
 
 def _state_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
