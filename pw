@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
-# Run the watcher using the shared venv, without installing anything.
+# Run the watcher from a virtualenv, without installing anything.
+#
+# The interpreter is looked for in this order:
+#   $PW_PYTHON, ./.venv, ../venv (a venv shared with sibling projects),
+#   python3 from PATH.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHONPATH="$here/src" exec "$here/../venv/bin/python" -m portfolio.cli "$@"
+
+python="${PW_PYTHON:-}"
+if [ -z "$python" ]; then
+    for candidate in "$here/.venv/bin/python" "$here/../venv/bin/python"; do
+        if [ -x "$candidate" ]; then
+            python="$candidate"
+            break
+        fi
+    done
+fi
+
+PYTHONPATH="$here/src" exec "${python:-python3}" -m portfolio.cli "$@"
