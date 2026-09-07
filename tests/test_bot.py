@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import time
 
 import httpx
@@ -49,8 +51,17 @@ class Telegram:
     """Records every Bot API call and answers with a shaped response."""
 
     def __init__(self, updates=None, edit_status=200,
-                 edit_error="message is not modified"):
+                 edit_error="message is not modified", poll_failures=0,
+                 stop_when_empty=False):
         self.updates = list(updates or [])
+        # Telegram's own 502, which is what the real service does several times
+        # a day; the count is how many polls in a row get it.
+        self.poll_failures = poll_failures
+        # A test that drives run() needs the loop to end. 401 is the exit the
+        # loop already has, and a mock transport answers instantly - so a poll
+        # that always succeeds would spin without ever yielding to the test.
+        self.stop_when_empty = stop_when_empty
+        self.polls = 0
         self.sent: list[dict] = []
         self.edited: list[dict] = []
         self.acked: list[str] = []
@@ -64,6 +75,12 @@ class Telegram:
         self.calls.append(method)
         payload = json.loads(request.content or b"{}")
         if method == "getUpdates":
+            self.polls += 1
+            if self.poll_failures > 0:
+                self.poll_failures -= 1
+                return httpx.Response(502, text='{"ok":false,"description":"Bad Gateway"}')
+            if self.stop_when_empty and not self.updates:
+                return httpx.Response(401, text='{"ok":false,"description":"Unauthorized"}')
             batch, self.updates = self.updates, []
             return httpx.Response(200, json={"ok": True, "result": batch})
         if method == "sendMessage":
@@ -407,3 +424,91 @@ async def test_a_command_prices_at_the_command_ttl_not_the_loops(setup):
     bot = make(setup, tg, prices=prices)
     await bot.handle(update("/portfolio"))
     assert prices.ttls == [1], "the loop's 60 minutes must not reach a command"
+
+
+def flaky(setup, monkeypatch, failures):
+    """A bot whose Telegram answers 502 `failures` times, then serves /status
+    and shuts the loop down."""
+    cfg, conn = setup
+    dbmod.set_meta(conn, botmod.OFFSET_KEY, "1")
+    tg = Telegram([update("/status")], poll_failures=failures, stop_when_empty=True)
+    bot = botmod.CommandBot(cfg, conn, Prices(), client=tg.client(), poll_timeout=0)
+    monkeypatch.setattr(botmod, "_backoff", lambda failures: 0.0)
+    return tg, bot
+
+
+def poll_failures(caplog):
+    return [r for r in caplog.records
+            if "poll failed" in r.getMessage() or "unreachable" in r.getMessage()]
+
+
+async def test_a_telegram_hiccup_costs_a_line_not_a_traceback(setup, monkeypatch, caplog):
+    """Telegram answers 502 several times a day, and holds a long poll past its
+    own timeout besides. Logged as crashes, those teach whoever reads the log to
+    skip poll failures - and then the one that matters, a revoked token or a
+    host with no route out, is buried in the noise it looks exactly like."""
+    tg, bot = flaky(setup, monkeypatch, failures=2)
+    with caplog.at_level(logging.WARNING, logger="portfolio.bot"):
+        await asyncio.wait_for(bot.run(), timeout=5)
+
+    assert tg.sent, "the loop gave up instead of outliving two 502s"
+    records = poll_failures(caplog)
+    assert len(records) == 2
+    assert {r.levelno for r in records} == {logging.WARNING}
+    assert not any(r.exc_info for r in records)
+
+
+async def test_an_outage_long_enough_to_matter_gets_loud(setup, monkeypatch, caplog):
+    """The quiet treatment is for hiccups. A Telegram unreachable for several
+    polls in a row is a real fault, and the one traceback is what says which
+    fault it is - without repeating the stack for as long as the outage runs."""
+    tg, bot = flaky(setup, monkeypatch, failures=botmod.LOUD_AFTER + 1)
+    with caplog.at_level(logging.INFO, logger="portfolio.bot"):
+        await asyncio.wait_for(bot.run(), timeout=5)
+
+    assert tg.sent, "commands never came back"
+    loud = [r for r in poll_failures(caplog) if r.levelno == logging.ERROR]
+    assert len(loud) == 2
+    assert loud[0].exc_info and not loud[1].exc_info
+    assert any("telegram back after" in r.getMessage() for r in caplog.records), \
+        "an outage announced has to be announced over"
+
+
+async def test_a_hiccup_at_startup_does_not_take_commands_away(setup, monkeypatch, caplog):
+    """`_resume` is a getUpdates like any other. It used to sit outside the
+    loop's handling, so a 502 in the second the process happened to start left
+    the watcher running and the bot dead until somebody noticed."""
+    cfg, conn = setup
+    tg = Telegram([update("/status")], poll_failures=2, stop_when_empty=True)
+    bot = botmod.CommandBot(cfg, conn, Prices(), client=tg.client(), poll_timeout=0)
+    monkeypatch.setattr(botmod, "_backoff", lambda failures: 0.0)
+    await asyncio.wait_for(bot.run(), timeout=5)
+
+    # Startup finished: the menu was registered and the offset written, which
+    # only happens on the far side of _resume.
+    assert "setMyCommands" in tg.calls
+    assert dbmod.get_meta(conn, botmod.OFFSET_KEY)
+
+
+async def test_a_revoked_token_stops_the_bot_instead_of_retrying_forever(setup):
+    """The retry is for failures that can pass. A 401 answers the same way every
+    time, and a loop asking it every minute is a busy way to stay off."""
+    cfg, conn = setup
+
+    def unauthorized(request):
+        return httpx.Response(401, text='{"ok":false,"description":"Unauthorized"}')
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(unauthorized))
+    bot = botmod.CommandBot(cfg, conn, Prices(), client=client, poll_timeout=0)
+    await asyncio.wait_for(bot.run(), timeout=5)
+
+
+def test_a_telegram_that_stays_down_is_asked_less_and_less():
+    """A 502 comes back instantly, so a fixed pause means twelve requests a
+    minute for as long as the outage lasts: the wait has to actually grow. The
+    cap is what keeps a recovered Telegram from being left waiting."""
+    waits = [max(botmod._backoff(n) for _ in range(50)) for n in range(1, 12)]
+    assert waits[0] <= botmod.BACKOFF
+    assert waits[1] > waits[0]
+    assert all(w <= botmod.BACKOFF_CAP for w in waits)
+    assert waits[-1] > botmod.BACKOFF_CAP / 2, "jitter must not swallow the cap"

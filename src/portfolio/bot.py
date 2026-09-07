@@ -16,6 +16,7 @@ week-old /scan running again.
 
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -37,6 +38,12 @@ LAST_TICK = "watch:last_tick"
 POLL_TIMEOUT = 30
 """Seconds Telegram holds the request open when there is nothing to say."""
 BACKOFF = 5.0
+"""Pause after the first failed poll. Doubles up to BACKOFF_CAP while Telegram
+stays unreachable: a 502 comes back instantly, so a flat pause asks a dead
+Telegram twelve times a minute for as long as it is dead."""
+BACKOFF_CAP = 60.0
+LOUD_AFTER = 5
+"""Consecutive failed polls before the log stops calling it a hiccup."""
 STALE_SECONDS = 300
 """A command older than this is not answered. The bot may have been down for a
 day; a question asked yesterday is not a question now, and replying to it looks
@@ -59,6 +66,41 @@ HELP = [
 
 ALIAS = {"start": "help"}
 """Telegram sends /start on the first ever message; it means "what is this"."""
+
+
+def _backoff(failures: int) -> float:
+    """How long to wait before asking Telegram again, after `failures` in a row.
+
+    Exponential, unlike `retry.with_retry`'s full jitter, and for the opposite
+    reason: jitter is there to keep several addresses from retrying a provider
+    in lockstep, and there is exactly one poll loop. Spreading the pause
+    uniformly from zero would only undo the point of having one. The remaining
+    jitter is the small kind, so the retries do not line up with whatever
+    upstream schedule caused the outage.
+    """
+    delay = min(BACKOFF_CAP, BACKOFF * 2 ** (failures - 1))
+    return delay * random.uniform(0.5, 1.0)
+
+
+def _log_poll_failure(failures: int, exc: Exception) -> None:
+    """Log a failed poll at the volume it has earned.
+
+    Telegram answers 502 often enough, and holds a long poll open past its own
+    timeout often enough, that a traceback per occurrence teaches the reader to
+    skip them - and then the failure that matters, a token revoked or a host
+    with no route out, looks exactly like the noise it is buried in. So a
+    hiccup is one line, and only an outage that outlives LOUD_AFTER polls is
+    worth a traceback. Past that it stays loud but stops repeating the stack:
+    the backoff has already capped, and an hour of downtime should read as an
+    hour of downtime, not as an hour of crashes.
+    """
+    if failures < LOUD_AFTER:
+        log.warning("poll failed (%d): %s", failures, exc)
+    elif failures == LOUD_AFTER:
+        log.error("telegram unreachable, %d polls failed", failures, exc_info=exc)
+    else:
+        log.error("telegram unreachable, %d polls failed: %s", failures, exc)
+
 
 LABEL = {"portfolio": "Portfolio", "digest": "Digest", "status": "Status",
          "health": "Health", "scan": "Scan", "help": "Help"}
@@ -297,13 +339,27 @@ class CommandBot:
         A bad token disables commands and leaves the watcher watching: losing
         the ability to ask questions must not cost the alerts.
         """
-        try:
-            await self._resume()
-            await self._announce()
-        except Permanent as e:
-            log.error("telegram commands off: %s", e)
-            return
+        failures = 0
+        while True:
+            # Startup must be no more fragile than the loop: `_resume` is a
+            # getUpdates like any other, and a 502 answering it used to end the
+            # task outright - commands gone until someone restarted the
+            # process, over the same hiccup the loop shrugs off.
+            try:
+                await self._resume()
+                await self._announce()
+                break
+            except asyncio.CancelledError:
+                raise
+            except Permanent as e:
+                log.error("telegram commands off: %s", e)
+                return
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                _log_poll_failure(failures, e)
+                await asyncio.sleep(_backoff(failures))
         log.info("answering commands in chat %s", self._chat)
+        failures = 0
         while True:
             try:
                 for update in await self._updates():
@@ -317,14 +373,20 @@ class CommandBot:
                         # Including a 400 from sendMessage: one unanswerable
                         # update must not end the conversation.
                         log.exception("update %d failed", update["update_id"])
+                if failures >= LOUD_AFTER:
+                    # Only worth saying when the silence was loud enough to
+                    # have worried somebody reading the log.
+                    log.info("telegram back after %d failed poll(s)", failures)
+                failures = 0
             except asyncio.CancelledError:
                 raise
             except Permanent as e:
                 log.error("telegram commands off: %s", e)
                 return
-            except Exception:  # noqa: BLE001
-                log.exception("poll failed")
-                await asyncio.sleep(BACKOFF)
+            except Exception as e:  # noqa: BLE001
+                failures += 1
+                _log_poll_failure(failures, e)
+                await asyncio.sleep(_backoff(failures))
 
     # ---- dispatch ----------------------------------------------------------
 
