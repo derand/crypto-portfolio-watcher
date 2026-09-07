@@ -16,8 +16,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# uid/gid 1000 is the default user on Raspberry Pi OS, so the bind-mounted
-# ./data is writable out of the box. Override with PUID/PGID in .env elsewhere.
+# uid/gid 1000 is the first non-root user on most Linux distributions, so the
+# bind-mounted ./data is writable out of the box. Where `id -u` says otherwise,
+# override with PUID/PGID in .env.
 RUN groupadd -g 1000 app && useradd -u 1000 -g 1000 -M -d /app app
 
 COPY requirements.txt ./

@@ -1,10 +1,11 @@
-# Runtime dependencies, pinned to the versions of the shared venv (../venv).
-# Nothing here is new: the same four packages the project already imports.
+# Runtime dependencies, pinned. The whole list: the four packages the project
+# imports, plus the keccak backend one of them needs.
 httpx==0.28.1        # every provider client
 pydantic==2.12.5     # config validation
 PyYAML==6.0.3        # config/portfolio.yaml
 eth-utils==5.3.1     # keccak, for EVM call selectors
-# eth-utils imports keccak lazily and raises ImportError without a backend; in
-# the shared venv it comes in with web3, here it has to be asked for.
+# eth-utils imports keccak lazily and raises ImportError without a backend. It
+# normally arrives as a dependency of web3, which this project does not install,
+# so the backend has to be asked for explicitly.
 eth-hash[pycryptodome]==0.7.1
 pycryptodome==3.23.0

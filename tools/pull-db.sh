@@ -24,6 +24,10 @@ LOCAL="${PW_LOCAL_DB:-data/vps.db}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
+# The two checks below use nothing but the standard library, so any Python 3
+# does; PW_PYTHON is the same knob ./pw reads.
+py="${PW_PYTHON:-python3}"
+
 if [ -z "$REMOTE" ]; then
     echo "pull-db: set PW_REMOTE to the VPS, e.g." >&2
     echo "pull-db:   PW_REMOTE=rem0te@vps.example.net tools/pull-db.sh" >&2
@@ -67,7 +71,7 @@ mkdir -p "$(dirname "$LOCAL")"
 scp -q "$REMOTE:$REMOTE_DIR/data/snapshot.db" "$LOCAL.part"
 ssh "$REMOTE" "rm -f $REMOTE_DIR/data/snapshot.db"
 
-../venv/bin/python - "$LOCAL.part" <<'CHECK'
+"$py" - "$LOCAL.part" <<'CHECK'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 ok = conn.execute("PRAGMA quick_check").fetchone()[0]
@@ -80,7 +84,7 @@ CHECK
 rm -f "$LOCAL-wal" "$LOCAL-shm"
 mv "$LOCAL.part" "$LOCAL"
 
-../venv/bin/python - "$LOCAL" <<'REPORT'
+"$py" - "$LOCAL" <<'REPORT'
 import sqlite3, sys
 from datetime import datetime
 conn = sqlite3.connect(sys.argv[1])

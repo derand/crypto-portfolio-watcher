@@ -15,8 +15,9 @@ x-app: &app
     context: .
     target: base
   image: portfolio-watcher:latest
-  # The uid:gid that ./data is written as on the host. 1000 is the default user
-  # on Raspberry Pi OS; if `id -u` says otherwise, put PUID/PGID in .env.
+  # The uid:gid that ./data is written as on the host. 1000 is the first
+  # non-root user on most Linux distributions; if `id -u` says otherwise, put
+  # PUID/PGID in .env.
   user: "${PUID:-1000}:${PGID:-1000}"
   env_file: .env
   environment:

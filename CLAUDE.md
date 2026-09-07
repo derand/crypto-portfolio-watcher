@@ -9,8 +9,10 @@ changes, and update it when a decision turns out wrong (several already have).
 
 ## Commands
 
-Everything runs through `./pw`, which uses the shared venv at `../venv` and installs
-nothing. Adding a dependency is a decision to raise with the user, not a step.
+Everything runs through `./pw`, which installs nothing: it runs the CLI on the first
+interpreter it finds, `$PW_PYTHON`, then `./.venv`, then `../venv` (a venv shared with
+sibling projects), then `python3`. Adding a dependency is a decision to raise with the
+user, not a step.
 
 ```bash
 ./pw config-check            # validate config, print what would be polled
@@ -25,9 +27,11 @@ nothing. Adding a dependency is a decision to raise with the user, not a step.
 ./pw bot                     # answer Telegram commands only, no scan loop
 ./pw -v scan                 # verbose; the flag goes BEFORE the subcommand
 
-../venv/bin/python -m pytest -q                      # all tests
-../venv/bin/python -m pytest -q tests/test_evm.py    # one file
-../venv/bin/python -m pytest -q -k marker            # one test by name
+# pytest is not a `./pw` subcommand: call whichever venv ./pw picks, directly
+# (`.venv/bin/python` here, `../venv/bin/python` where the venv is shared).
+.venv/bin/python -m pytest -q                      # all tests
+.venv/bin/python -m pytest -q tests/test_evm.py    # one file
+.venv/bin/python -m pytest -q -k marker            # one test by name
 ```
 
 `init-db` only syncs config into the database; it never fetches. **After editing
