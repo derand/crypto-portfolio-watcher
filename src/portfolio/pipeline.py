@@ -428,6 +428,25 @@ def _pending_batch(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _who(counterparty: str | None) -> str:
+    """The other side of a transfer, short enough to sit at the end of a line.
+
+    An address is cut in the middle: both ends are what anyone checks one by,
+    while the thirty characters between them cost the line more than they say.
+    A counterparty holding a colon is a label this codebase wrote rather than an
+    address a provider gave - "validator:806123" - and there the tail is the
+    whole of the identity, so it is left alone. Cutting everything to twelve
+    made every beacon withdrawal read "validator:80…", which names a different
+    validator each time, and an unknown counterparty read "?…" - an ellipsis
+    standing for nothing that was elided.
+    """
+    if not counterparty:
+        return "?"
+    if ":" in counterparty or len(counterparty) <= 13:
+        return counterparty
+    return f"{counterparty[:8]}…{counterparty[-4:]}"
+
+
 def render(events: list[dict]) -> Message:
     lines, high = [], False
     for e in events:
@@ -442,7 +461,7 @@ def render(events: list[dict]) -> Message:
             continue
         amount = format_units(int(e["amount_raw"]), e["decimals"] or 0)
         arrow = ARROW.get(Direction(e["direction"]), "·") if e["direction"] else "·"
-        who = e["counterparty"] or "?"
+        who = _who(e["counterparty"])
         if e["resent"]:
             tail = "  ↳ confirmed"          # follow-up to a message already sent
         elif e["status"] != "confirmed":
@@ -452,7 +471,7 @@ def render(events: list[dict]) -> Message:
         where = f"{e['label']}/{e['scope']}" if e["scope"] else e["label"]
         worth = f" (${e['usd']:,.2f})" if e["usd"] else ""
         lines.append(f"{where}  {arrow} {amount} {e['symbol'] or ''}{worth}  "
-                     f"{who[:12]}…{tail}".rstrip())
+                     f"{who}{tail}".rstrip())
     title = "Portfolio: 1 change" if len(events) == 1 else f"Portfolio: {len(events)} changes"
     return Message(title=title, body="\n".join(lines),
                    severity=Severity.HIGH if high else Severity.NORMAL,
@@ -502,7 +521,8 @@ def _upsert_position(conn, address_id: int, p, asset_id: int | None) -> None:
 
 def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
                     amount_raw: int, kind: str = EventKind.POSITION_CHANGE.value,
-                    pnl_usd: float | None = None) -> int | None:
+                    pnl_usd: float | None = None,
+                    usd: float | None = None) -> int | None:
     """Insert one position event; None if it was already recorded.
 
     The uid carries the new state, so an unchanged position produces the same
@@ -515,9 +535,9 @@ def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
         return None
     cur = conn.execute(
         """INSERT INTO events(chain, scope, address_id, tx_hash, uid, kind,
-                              amount_raw, ts, status, detail, pnl_usd)
-           VALUES (?,'',?,'',?,?,?,?, 'confirmed', ?, ?)""",
-        (chain, address_id, uid, kind, str(amount_raw), _now(), detail, pnl_usd))
+                              amount_raw, usd, ts, status, detail, pnl_usd)
+           VALUES (?,'',?,'',?,?,?,?,?, 'confirmed', ?, ?)""",
+        (chain, address_id, uid, kind, str(amount_raw), usd, _now(), detail, pnl_usd))
     return cur.lastrowid
 
 
@@ -556,7 +576,8 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
     baseline = cursor.is_fresh
 
     previous = {r["position_key"]: r for r in conn.execute(
-        """SELECT p.position_key, p.amount_raw, p.extra, s.decimals, s.symbol
+        """SELECT p.position_key, p.amount_raw, p.extra, s.decimals, s.symbol,
+                  s.asset_key
              FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
             WHERE p.address_id=? AND p.protocol=?""",
         (address_id, source.name))}
@@ -605,16 +626,26 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
 
             if not baseline:
                 eid = None
+                # What the move was worth, signed, computed once: the threshold
+                # below decides with it and the line says it, so the number that
+                # rang and the number that is read are the same number.
+                moved = _usd_of(prices, p.asset_key,
+                                p.amount_raw - (before or 0), p.decimals)
+                # Except on a leveraged position, where it is a notional rather
+                # than money. A perp's dollars sitting in the same parentheses
+                # as a spot balance's would read as the same kind of thing.
+                shown = None if p.extra.get("side") else moved
                 if before is None:
                     eid = _position_event(
                         conn, chain, address_id, f"{p.key}:{p.amount_raw}",
-                        _opened_text(p), p.amount_raw)
+                        _opened_text(p, shown), p.amount_raw, usd=shown)
                 elif before != p.amount_raw:
                     trade = trades.get(p.key)
                     eid = _position_event(
                         conn, chain, address_id, f"{p.key}:{p.amount_raw}",
-                        _changed_text(p, before) + _trade_tail(trade), p.amount_raw,
-                        pnl_usd=trade.pnl_usd if trade else None)
+                        _changed_text(p, before, shown) + _trade_tail(trade),
+                        p.amount_raw,
+                        pnl_usd=trade.pnl_usd if trade else None, usd=shown)
                 if eid:
                     res.new_events += 1
                     # The same threshold transfers get. A Hyperliquid spot
@@ -623,9 +654,6 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                     # position path used to queue unconditionally. Measured in
                     # the *change*, not the position - a $500 deposit still
                     # speaks, a 1.2-cent funding payment does not.
-                    moved = (prices.value(p.asset_key, abs(p.amount_raw - (before or 0)),
-                                          p.decimals)
-                             if prices is not None and p.asset_key else None)
                     if _worth_saying(cfg, moved):
                         _queue(conn, eid, channels)
                     else:
@@ -643,9 +671,11 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
             # for Bitcoin and for Hyperliquid's scale, and wrong by ten orders
             # of magnitude for an exited 18-decimal validator.
             trade = trades.get(key)
+            worth = (None if _extra(row).get("side") else
+                     _usd_of(prices, row["asset_key"], before, row["decimals"] or 8))
             eid = _position_event(conn, chain, address_id, f"{key}:closed:{before}",
-                                  _closed_text(key, before, row, trade), before,
-                                  pnl_usd=trade.pnl_usd if trade else None)
+                                  _closed_text(key, before, row, trade, worth), before,
+                                  pnl_usd=trade.pnl_usd if trade else None, usd=worth)
             if eid:
                 res.new_events += 1
                 _queue(conn, eid, channels)
@@ -660,7 +690,32 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
         log.info("%s/%s: baseline recorded, watching from now", target.label, chain)
 
 
-def _opened_text(p) -> str:
+def _usd_of(prices, asset_key: str, amount_raw: int, decimals: int) -> float | None:
+    """What an amount is worth, or None when nobody has quoted the asset."""
+    if prices is None or not asset_key:
+        return None
+    return prices.value(asset_key, amount_raw, decimals)
+
+
+def _usd_tail(usd: float | None, signed: bool = False) -> str:
+    """The dollar figure a position line carries, in the parentheses transfers
+    already use.
+
+    Nothing at all when the price is unknown: "($0.00)" is a claim that the
+    thing is worthless, and an unpriced asset is one nobody has quoted - the
+    same reason `_worth_saying` lets it through rather than silencing it.
+    Anything under a cent says so instead of rounding to zero, because a line
+    about dust must still be readable as dust.
+    """
+    if usd is None:
+        return ""
+    sign = ("+" if usd >= 0 else "-") if signed else ""
+    if abs(usd) < 0.01:
+        return f" ({sign}<$0.01)"
+    return f" ({sign}${abs(usd):,.2f})"
+
+
+def _opened_text(p, usd: float | None = None) -> str:
     side = p.extra.get("side")
     if side:
         bits = [f"opened {side} {_fmt(abs(p.amount_raw), p.decimals)} {p.symbol}"]
@@ -671,7 +726,7 @@ def _opened_text(p) -> str:
         if p.extra.get("liq_px"):
             bits.append(f"liq {_px(p.extra['liq_px'])}")
         return " ".join(bits)
-    return f"{p.key} {_fmt(p.amount_raw, p.decimals)} {p.symbol}"
+    return f"{p.key} {_fmt(p.amount_raw, p.decimals)} {p.symbol}{_usd_tail(usd)}"
 
 
 def _px(text: str) -> str:
@@ -691,12 +746,17 @@ def _px(text: str) -> str:
     return out.rstrip("0").rstrip(".") if "." in out else out
 
 
-def _changed_text(p, before: int) -> str:
+def _changed_text(p, before: int, usd: float | None = None) -> str:
+    """Signed, because the arrow says which way and not how much: a balance
+    going 0.5 → 65.5 USDC and one going 0.0008 → 0.00001 UBTC are two sides of
+    one sale, and only the dollars make them recognisable as that."""
     return (f"{p.key} {_fmt(before, p.decimals)} → "
-            f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}")
+            f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}"
+            f"{_usd_tail(usd, signed=True)}")
 
 
-def _closed_text(key: str, before: int, row, trade) -> str:
+def _closed_text(key: str, before: int, row, trade,
+                 usd: float | None = None) -> str:
     """The line a closed position leaves behind.
 
     With a Trade it mirrors `_opened_text`, so the two ends of the same position
@@ -707,7 +767,7 @@ def _closed_text(key: str, before: int, row, trade) -> str:
     while nobody was looking.
     """
     decimals = row["decimals"] or 8
-    plain = f"closed {key} ({_fmt(before, decimals)})"
+    plain = f"closed {key} {_fmt(before, decimals)}{_usd_tail(usd)}"
     if trade is None:
         return plain
     extra = _extra(row)

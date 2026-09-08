@@ -742,6 +742,117 @@ async def test_a_closed_position_is_printed_in_its_own_decimals(tmp_path):
     assert "32" in detail and "320000000000" not in detail, detail
 
 
+def test_a_counterparty_label_survives_where_an_address_is_elided():
+    """A beacon withdrawal's counterparty is a label this codebase writes, not
+    an address, and "validator:" alone is ten of the twelve characters the line
+    used to keep: every withdrawal read "validator:80…", which is four missing
+    digits and therefore a different validator each time. An address is still
+    cut, but from the middle, because both of its ends are what one is checked
+    by - and the ellipsis now appears only where something was actually cut."""
+    assert pipeline._who("validator:123456") == "validator:123456"
+    assert pipeline._who("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984") == "0x1f9840…f984"
+    assert pipeline._who(None) == "?", "an ellipsis must not stand for nothing"
+    assert pipeline._who("bc1qmadeupaddressfortests0000") == "bc1qmade…0000"
+
+
+def test_a_transfer_line_names_the_validator_that_paid_it():
+    """The rendered line, not just the helper: this is what arrives in Telegram
+    when a validator withdrawal lands."""
+    event = {"kind": "transfer", "label": "staking-eth", "scope": "ethereum",
+             "amount_raw": "14383075000000000", "decimals": 18, "symbol": "ETH",
+             "direction": "in", "counterparty": "validator:123456", "usd": 36.11,
+             "status": "confirmed", "resent": 0, "uid": "w-1"}
+    body = pipeline.render([event]).body
+    assert body == "staking-eth/ethereum  ← 0.014383075 ETH ($36.11)  validator:123456"
+
+
+def test_a_dollar_figure_never_rounds_a_holding_down_to_nothing():
+    """"($0.00)" is a claim that something is worthless, and dust is not
+    worthless - it is small. An unpriced asset gets no parentheses at all,
+    because a missing quote is not a value of zero, and a line that says $0.00
+    about a coin nobody has quoted is worse than one that says nothing."""
+    assert pipeline._usd_tail(65.011682) == " ($65.01)"
+    assert pipeline._usd_tail(65.011682, signed=True) == " (+$65.01)"
+    assert pipeline._usd_tail(-66.119, signed=True) == " (-$66.12)"
+    assert pipeline._usd_tail(0.0072) == " (<$0.01)"
+    assert pipeline._usd_tail(None) == "" and pipeline._usd_tail(None, True) == ""
+
+
+async def test_the_two_legs_of_a_spot_sale_say_what_each_was_worth(tmp_path):
+    """Two lines saying "0.5 → 65.5 USDC" and "0.0008 → 0.00001 UBTC" are one
+    sale, and nothing in the quantities says so: one is eight decimals of a coin
+    worth eighty thousand dollars and the other is dollars. The signed figure is
+    the change, not the holding - the same number the threshold measured, so the
+    message shows why it rang."""
+    cfg, conn = setup_hl(tmp_path)
+    prices = FakePrices({"hyperliquid:USDC": 1.0, "hyperliquid:UBTC": 79661.5})
+    src = FakeSource([[account(), spot("USDC", 50058507), spot("UBTC", 83943)],
+                      [account(), spot("USDC", 6551226785), spot("UBTC", 943)]])
+    router = FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+
+    body = router.sent[0].body
+    assert "spot:USDC 0.50058507 → 65.51226785 USDC (+$65.01)" in body, body
+    assert "spot:UBTC 0.00083943 → 0.00000943 UBTC (-$66.12)" in body, body
+
+
+async def test_a_closed_position_says_what_it_was_worth_when_it_went(tmp_path):
+    """The dust left by a sale closes days later, as its own message, with no
+    other line to give it scale: "closed spot:UBTC 0.00000959" could be seventy
+    cents or seventy thousand dollars. Priced from the stored amount, since the
+    position is gone by the time anyone asks."""
+    cfg, conn = setup_hl(tmp_path)
+    prices = FakePrices({"hyperliquid:USDC": 1.0, "hyperliquid:UBTC": 79661.5})
+    src = FakeSource([[account(), spot("USDC"), spot("UBTC", 959)],
+                      [account(), spot("USDC")]])
+    router = FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+
+    assert "closed spot:UBTC 0.00000959 ($0.76)" in router.sent[0].body
+    row = conn.execute("SELECT usd FROM events WHERE detail LIKE 'closed%'").fetchone()
+    assert round(row["usd"], 2) == 0.76, "and the figure is stored, not only printed"
+
+
+async def test_an_unpriced_position_change_says_nothing_about_dollars(tmp_path):
+    """Silence must never be the consequence of not knowing what something is
+    worth: the line still arrives, and it simply carries no figure."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), spot("WHAT", 100000000)],
+                      [account(), spot("WHAT", 900000000)]])
+    router = FakeRouter()
+    prices = FakePrices({})                             # nothing has a price
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+    await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+
+    body = router.sent[0].body
+    assert "spot:WHAT 1 → 9 WHAT" in body and "$" not in body, body
+
+
+async def test_a_leveraged_position_line_carries_no_dollar_figure(tmp_path):
+    """A perp's dollars are a notional - exposure, not money - and in the same
+    parentheses a spot balance uses they would read as the same kind of number.
+    Only the display is suppressed: the threshold still measures the change,
+    which is what keeps a perp resizing by a cent out of the alerts."""
+    cfg, conn = setup_hl(tmp_path)
+    cfg.thresholds.notify_usd = 1.0
+    prices = FakePrices({"hyperliquid:USDC": 1.0, "hyperliquid:ETH": 3000.0})
+    src = FakeSource([[account(), spot()],
+                      [account(), spot(), perp()],
+                      [account(), spot()]])
+    router = FakeRouter()
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+
+    bodies = [m.body for m in router.sent]
+    assert "opened long 1.5 ETH" in bodies[0] and "$" not in bodies[0]
+    assert "closed perp:ETH 1.5" in bodies[1] and "$" not in bodies[1]
+    stored = [r["usd"] for r in conn.execute(
+        "SELECT usd FROM events WHERE detail LIKE 'opened%' OR detail LIKE 'closed%'")]
+    assert stored == [None, None]
+
+
 class FakeDebtChain:
     """One address owing a variable debt token. `owed` is what the token says;
     the snapshot carries it negated, the way the EVM adapter builds it."""
