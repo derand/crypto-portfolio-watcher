@@ -17,15 +17,25 @@ __all__ = ["PriceBook", "PriceSources", "build_prices"]
 
 def build_prices(cfg, conn):
     return PriceBook(conn, PriceSources(cfg.api_keys.coingecko),
-                     ttl_minutes=cfg.prices.ttl_minutes)
+                     ttl_minutes=cfg.prices.ttl_minutes,
+                     max_age_minutes=cfg.prices.max_age_minutes)
 
 
 class PriceBook:
-    def __init__(self, conn, sources: PriceSources, ttl_minutes: int = 15):
+    def __init__(self, conn, sources: PriceSources, ttl_minutes: int = 15,
+                 max_age_minutes: int = 180):
         self._conn = conn
         self._sources = sources
         self._ttl = timedelta(minutes=ttl_minutes)
+        self._max_age = timedelta(minutes=max_age_minutes)
         self._cache: dict[str, float] = {}
+        """Only what is currently young enough to quote.
+
+        Rebuilt from the database on every refresh, never added to across them.
+        It used to only ever grow: a price fetched once stayed in memory, so a
+        long-lived `watch` that lost its price source went on answering with
+        whatever it had last seen - for days - while `refresh` logged a warning
+        nobody reads and every total on screen looked current."""
 
     async def aclose(self) -> None:
         await self._sources.aclose()
@@ -39,15 +49,30 @@ class PriceBook:
             return None
         return amount_raw / (10 ** decimals) * price
 
-    def _load_fresh(self, assets: list[dict], ttl: timedelta) -> set[str]:
-        """Seed the cache from rows written recently enough to still be true."""
-        cutoff = (datetime.now(timezone.utc) - ttl).isoformat()
+    def _reload(self, ttl: timedelta) -> set[str]:
+        """Rebuild the cache from stored prices; return the ones still fresh.
+
+        Two ages, because they answer different questions. `max_age` decides
+        what may still be quoted at all and so what the cache holds; `ttl`
+        decides what is recent enough not to ask about again, and is what the
+        caller gets back. Everything older than `max_age` is simply absent,
+        which is how an asset becomes unpriced rather than silently stale.
+
+        Ordered oldest first so that the newest row for an asset is the one left
+        in the dictionary.
+        """
+        now = datetime.now(timezone.utc)
+        # max(): a TTL longer than max_age would otherwise ask for rows the
+        # cache is not allowed to hold, and report them fresh.
+        cutoff = (now - max(self._max_age, ttl)).isoformat()
         rows = self._conn.execute(
-            """SELECT a.asset_key, p.usd FROM prices p JOIN assets a ON a.id = p.asset_id
-               WHERE p.ts >= ? ORDER BY p.ts""", (cutoff,)).fetchall()
-        for row in rows:
-            self._cache[row["asset_key"]] = row["usd"]
-        return {row["asset_key"] for row in rows}
+            """SELECT a.asset_key, p.usd, p.ts FROM prices p
+                 JOIN assets a ON a.id = p.asset_id
+                WHERE p.ts >= ? ORDER BY p.ts""", (cutoff,)).fetchall()
+        quotable = (now - self._max_age).isoformat()
+        self._cache = {r["asset_key"]: r["usd"] for r in rows if r["ts"] >= quotable}
+        still_fresh = (now - ttl).isoformat()
+        return {r["asset_key"] for r in rows if r["ts"] >= still_fresh}
 
     async def refresh(self, assets: list[dict], ttl_minutes: int | None = None) -> None:
         """assets: dicts with asset_key, chain, contract, symbol, coingecko_id.
@@ -58,7 +83,7 @@ class PriceBook:
         total nobody asked for is not.
         """
         ttl = self._ttl if ttl_minutes is None else timedelta(minutes=ttl_minutes)
-        fresh = self._load_fresh(assets, ttl)
+        fresh = self._reload(ttl)
         stale = [a for a in assets if a["asset_key"] not in fresh]
         if not stale:
             return

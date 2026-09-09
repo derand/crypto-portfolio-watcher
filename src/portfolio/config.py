@@ -123,6 +123,20 @@ class PricesCfg(BaseModel):
     button rather than by a timer, which is why this can be small without
     threatening the monthly quota."""
 
+    max_age_minutes: int = 180
+    """How old a price may be before it stops counting as a price at all.
+
+    A different question from the two above, which only decide when to go and
+    ask again. This one decides what to do when asking failed: past this age the
+    asset is reported as unpriced rather than valued at the last number anyone
+    saw. Without it a `watch` process that lost CoinGecko kept quoting whatever
+    it had cached, for days, with nothing on screen to say so.
+
+    Comfortably longer than either TTL on purpose. Equal to a TTL it would blank
+    the portfolio on a single failed request; three hours is twelve background
+    refreshes, so it takes a real outage rather than a blip, and an unpriced
+    holding is a state the digest already knows how to say out loud."""
+
 
 class DigestCfg(BaseModel):
     enabled: bool = True

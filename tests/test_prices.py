@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import httpx
 import pytest
 
@@ -65,9 +67,29 @@ async def test_hyperliquid_mids_drop_numeric_pair_indices():
     assert mids == {"BTC": 77055.5, "ETH": 2382.55}
 
 
-def make_book(conn, routes, ttl=15):
+def make_book(conn, routes, ttl=15, max_age=180):
     http, seen = client(routes)
-    return PriceBook(conn, PriceSources(client=http), ttl_minutes=ttl), seen
+    return PriceBook(conn, PriceSources(client=http), ttl_minutes=ttl,
+                     max_age_minutes=max_age), seen
+
+
+def flaky(payload):
+    """One client that can be switched off mid-life, which is the shape of the
+    thing being tested: a single long-running book whose provider goes away."""
+    state = {"up": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not state["up"]:
+            return httpx.Response(503, json={})
+        return httpx.Response(200, json=payload)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), state
+
+
+def age_prices(conn, hours):
+    """Push every stored price into the past, as an outage would."""
+    conn.execute("UPDATE prices SET ts=?",
+                 ((datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(),))
 
 
 def register(conn, asset_key, chain, contract, symbol, coingecko_id=None):
@@ -78,6 +100,14 @@ def register(conn, asset_key, chain, contract, symbol, coingecko_id=None):
                   coingecko_id, "native" if not contract else "erc20"))
     return {"asset_key": asset_key, "chain": chain, "contract": contract,
             "symbol": symbol, "coingecko_id": coingecko_id}
+
+
+@pytest.fixture()
+def no_backoff(monkeypatch):
+    """Full jitter is the right policy against a real provider and pure wall
+    clock in a test: three attempts a refresh turned this file into most of the
+    suite's runtime. What backoff does is covered in test_notify."""
+    monkeypatch.setattr("portfolio.retry.random.uniform", lambda *_: 0.0)
 
 
 @pytest.fixture()
@@ -259,3 +289,57 @@ async def test_a_perp_row_that_kept_a_coin_name_is_still_priced(conn):
         {0: "USDC"}, [], []))), ttl_minutes=15)
     await book.refresh([btc])
     assert book.usd("hyperliquid:BTC") == pytest.approx(81000.0)
+
+
+async def test_a_price_too_old_to_believe_stops_being_a_price(conn, no_backoff):
+    """The cache only ever grew: a price fetched once stayed in memory for the
+    life of the process. A `watch` that lost CoinGecko therefore went on
+    answering with the last number it had seen - for days - while every total on
+    screen looked current and nothing said otherwise. Past max_age the holding
+    is unpriced instead, which the digest already knows how to report."""
+    eth = register(conn, "ethereum:native", "ethereum", None, "ETH", "ethereum")
+    http, state = flaky({"ethereum": {"usd": 2384.93}})
+    book = PriceBook(conn, PriceSources(client=http), ttl_minutes=15, max_age_minutes=180)
+    await book.refresh([eth])
+    assert book.usd("ethereum:native") == pytest.approx(2384.93)
+
+    state["up"] = False
+    age_prices(conn, hours=5)
+    await book.refresh([eth])
+    assert book.usd("ethereum:native") is None
+    assert book.value("ethereum:native", 10**18, 18) is None, \
+        "a stale price must not reach a total through value() either"
+
+
+async def test_a_failed_refresh_does_not_blank_a_price_that_is_merely_due(conn, no_backoff):
+    """Why max_age is not the TTL. /portfolio refreshes at a one-minute TTL, so
+    clearing whatever the TTL calls stale would empty the entire portfolio the
+    first time CoinGecko hiccupped - a far worse answer than a price a few
+    minutes old."""
+    eth = register(conn, "ethereum:native", "ethereum", None, "ETH", "ethereum")
+    http, state = flaky({"ethereum": {"usd": 2384.93}})
+    book = PriceBook(conn, PriceSources(client=http), ttl_minutes=15, max_age_minutes=180)
+    await book.refresh([eth])
+
+    state["up"] = False
+    for _ in range(5):
+        await book.refresh([eth], ttl_minutes=0)   # due every single time
+    assert book.usd("ethereum:native") == pytest.approx(2384.93)
+
+
+async def test_a_price_that_comes_back_is_used_again(conn, no_backoff):
+    """Dropping a stale price must not be permanent: the book has to recover on
+    its own when the provider does, without restarting the process."""
+    eth = register(conn, "ethereum:native", "ethereum", None, "ETH", "ethereum")
+    http, state = flaky({"ethereum": {"usd": 2384.93}})
+    book = PriceBook(conn, PriceSources(client=http), ttl_minutes=15, max_age_minutes=180)
+    await book.refresh([eth])
+
+    state["up"] = False
+    age_prices(conn, hours=5)
+    await book.refresh([eth])
+    assert book.usd("ethereum:native") is None
+
+    state["up"] = True
+    await book.refresh([eth])
+    assert book.usd("ethereum:native") == pytest.approx(2384.93)

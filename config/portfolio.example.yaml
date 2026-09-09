@@ -19,6 +19,13 @@ prices:
   # of its own, because the background TTL is a decision about the quota, while
   # this one is the number on the screen.
   command_ttl_minutes: 1
+  # And how old a price may be before it stops being a price at all. The two
+  # numbers above only say when to go and ask again; this one says what to do
+  # when asking failed. Past it the holding is reported as unpriced instead of
+  # valued at the last number anyone saw - a watcher that lost CoinGecko used to
+  # quote a days-old price with nothing on screen to say so. Well above either
+  # TTL on purpose: equal to one, a single failed request would blank the total.
+  max_age_minutes: 180
 
 digest:
   enabled: true
