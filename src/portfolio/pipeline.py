@@ -411,21 +411,52 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
         log.info("%s: baseline recorded, watching from now", where)
 
 
-def _pending_batch(conn) -> list[dict]:
-    """Everything still undelivered, including leftovers from earlier ticks."""
+def _pending_batch(conn, channel: str) -> list[dict]:
+    """Everything this one channel still owes, earlier ticks included.
+
+    Per channel, because channels do not fall behind together. Built across all
+    of them, the batch re-sent to whichever channel had already taken it - every
+    tick, for as long as the other stayed broken - and `resent` was a MAX over
+    the channels, so a first delivery to the channel that was behind arrived
+    labelled "confirmed" because a different one had sent it already. With the
+    channel fixed there is exactly one notifications row per event, which is why
+    the GROUP BY is gone too.
+    """
     rows = conn.execute(
         """SELECT e.id, e.kind, e.direction, e.amount_raw, e.counterparty,
                   e.status, e.detail, e.scope, e.uid, e.usd, a.label, a.chain,
                   s.symbol, s.decimals,
-                  MAX(n.sent_at IS NOT NULL) AS resent
+                  n.sent_at IS NOT NULL AS resent
            FROM notifications n
            JOIN events e ON e.id = n.event_id
            JOIN addresses a ON a.id = e.address_id
            LEFT JOIN assets s ON s.id = e.asset_id
-           WHERE n.status = 'pending'
-           GROUP BY e.id
-           ORDER BY e.id""").fetchall()
+           WHERE n.status = 'pending' AND n.channel = ?
+           ORDER BY e.id""", (channel,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def queue_state(conn) -> dict:
+    """What delivery still owes, and whether the queue is moving.
+
+    There is no 'failed' count here because there is no 'failed' state: a
+    notification that could not be sent stays pending and the next tick tries it
+    again, which is the entire reason events and notifications are separate
+    tables. Nothing ever wrote the status, so the "N failed" this replaces was a
+    zero that could not become anything else - a diagnostic line that could only
+    ever reassure. A queue that is not draining shows up as a pending row that
+    keeps getting older, so that is what this reports, with the last thing a
+    channel actually complained about.
+    """
+    row = conn.execute(
+        """SELECT COUNT(*) AS n, MIN(e.ts) AS oldest
+             FROM notifications x JOIN events e ON e.id = x.event_id
+            WHERE x.status = 'pending'""").fetchone()
+    last = conn.execute(
+        """SELECT channel, error FROM notifications
+            WHERE error IS NOT NULL ORDER BY id DESC LIMIT 1""").fetchone()
+    return {"pending": row["n"], "oldest": row["oldest"],
+            "error": f"{last['channel']}: {last['error']}" if last else ""}
 
 
 def _who(counterparty: str | None) -> str:
@@ -479,27 +510,37 @@ def render(events: list[dict]) -> Message:
 
 
 async def _deliver(conn, router) -> dict[str, str | None]:
-    batch = _pending_batch(conn)
-    if not batch or not router.channels:
-        return {}
-    results = await router.send(render(batch))
-    ids = [e["id"] for e in batch]
-    conn.execute("BEGIN")
-    try:
-        for channel, err in results.items():
+    """Hand each channel what it is still owed, and record the outcome per channel.
+
+    One channel at a time, and one batch per channel: a shared batch meant that
+    a Discord outage made the next tick send Telegram a second copy of every
+    alert it had already delivered.
+    """
+    results: dict[str, str | None] = {}
+    for channel in router.channels:
+        batch = _pending_batch(conn, channel)
+        if not batch:
+            continue
+        err = await router.send_to(channel, render(batch))
+        results[channel] = err
+        ids = [e["id"] for e in batch]
+        conn.execute("BEGIN")
+        try:
             if err is None:
+                # error=NULL: a stale message from an outage that has since
+                # cleared would otherwise be reported by queue_state forever.
                 conn.executemany(
-                    "UPDATE notifications SET status='sent', sent_at=? "
+                    "UPDATE notifications SET status='sent', sent_at=?, error=NULL "
                     "WHERE event_id=? AND channel=?",
                     [(_now(), i, channel) for i in ids])
             else:
                 conn.executemany(
                     "UPDATE notifications SET error=? WHERE event_id=? AND channel=?",
                     [(err[:500], i, channel) for i in ids])
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     return results
 
 

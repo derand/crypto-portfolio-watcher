@@ -156,16 +156,29 @@ def _ago(ts: str | None) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
+def _queue_line(queue: dict) -> str:
+    """The delivery queue in one phrase.
+
+    Age, not a failure count: nothing ever sets a notification to 'failed', so
+    the number this replaces could only ever read zero. A queue that has stopped
+    draining is a pending row that keeps getting older.
+    """
+    if not queue["pending"]:
+        return "all delivered"
+    return f"{queue['pending']} pending, oldest {_ago(queue['oldest'])}"
+
+
 def status_message(conn) -> Message:
     q = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
-    pending = q("SELECT COUNT(*) FROM notifications WHERE status='pending'")
-    failed = q("SELECT COUNT(*) FROM notifications WHERE status='failed'")
+    queue = pipeline.queue_state(conn)
     lines = [
         f"addresses   {q('SELECT COUNT(*) FROM addresses WHERE enabled=1')} enabled",
         f"assets      {q('SELECT COUNT(*) FROM assets')}",
         f"events      {q('SELECT COUNT(*) FROM events')}",
-        f"notify      {pending} pending, {failed} failed",
+        f"notify      {_queue_line(queue)}",
     ]
+    if queue["error"]:
+        lines.append(f"last error  {queue['error'][:44]}")
     blocks = [Block(lines=lines)]
     recent = [dict(r) for r in conn.execute(
         "SELECT ts, kind, detail FROM events ORDER BY ts DESC LIMIT 10").fetchall()]
@@ -190,11 +203,12 @@ def health_message(cfg, conn) -> Message:
         f"digest      {'sent today' if sent_today == datetime.now().date().isoformat() else 'not sent today'}"
         f", hour {cfg.digest.hour}",
     ]
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM notifications WHERE status='pending'").fetchone()[0]
-    failed = conn.execute(
-        "SELECT COUNT(*) FROM notifications WHERE status='failed'").fetchone()[0]
-    lines.append(f"notify      {pending} pending, {failed} failed")
+    queue = pipeline.queue_state(conn)
+    lines.append(f"notify      {_queue_line(queue)}")
+    if queue["error"]:
+        # The only place a delivery error is ever shown; it is recorded per
+        # notification row and was, until now, written and never read.
+        lines.append(f"last error  {queue['error'][:44]}")
     blocks = [Block(lines=lines)]
 
     # Three missed intervals: one slow provider is normal, three in a row is not.

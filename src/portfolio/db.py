@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     id         INTEGER PRIMARY KEY,
     event_id   INTEGER REFERENCES events(id),
     channel    TEXT NOT NULL,
-    status     TEXT NOT NULL,             -- pending|sent|failed
+    status     TEXT NOT NULL,             -- pending|sent; see pipeline.queue_state
     sent_at    TEXT,
     error      TEXT,
     UNIQUE(event_id, channel)

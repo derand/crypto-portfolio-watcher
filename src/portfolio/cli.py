@@ -81,9 +81,12 @@ def cmd_status(args) -> int:
     print(f"addresses   {q('SELECT COUNT(*) FROM addresses WHERE enabled=1')} enabled")
     print(f"assets      {q('SELECT COUNT(*) FROM assets')}")
     print(f"events      {q('SELECT COUNT(*) FROM events')}")
-    pending = q("SELECT COUNT(*) FROM notifications WHERE status='pending'")
-    failed = q("SELECT COUNT(*) FROM notifications WHERE status='failed'")
-    print(f"notify      {pending} pending, {failed} failed")
+    from . import pipeline
+    queue = pipeline.queue_state(conn)
+    print(f"notify      {queue['pending']} pending"
+          + (f", oldest {queue['oldest'][:19]}" if queue["pending"] else ""))
+    if queue["error"]:
+        print(f"last error  {queue['error'][:70]}")
     last = conn.execute("SELECT ts, kind, detail FROM events ORDER BY ts DESC LIMIT 5").fetchall()
     if last:
         print("recent")

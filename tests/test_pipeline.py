@@ -30,19 +30,32 @@ tokens: []
 
 
 class FakeRouter:
-    """Records what would have been sent; can be told to fail."""
+    """Records what each channel was handed; any channel can be told to fail.
 
-    def __init__(self, fail=None):
-        self.sent = []
+    `fail` is either an error string for every channel or a {channel: error}
+    map, which is what a partial outage looks like: Discord down, Telegram fine.
+    """
+
+    def __init__(self, fail=None, channels=("telegram",)):
+        self.sent = []                    # every Message handed to any channel
+        self.by_channel = {c: [] for c in channels}
         self.fail = fail
+        self._channels = list(channels)
 
     @property
     def channels(self):
-        return ["telegram"]
+        return list(self._channels)
+
+    def _err(self, channel):
+        return self.fail.get(channel) if isinstance(self.fail, dict) else self.fail
+
+    async def send_to(self, channel, msg):
+        self.sent.append(msg)
+        self.by_channel[channel].append(msg)
+        return self._err(channel)
 
     async def send(self, msg):
-        self.sent.append(msg)
-        return {"telegram": self.fail}
+        return {c: await self.send_to(c, msg) for c in self._channels}
 
 
 class FakeChain:
@@ -196,6 +209,88 @@ async def test_failed_delivery_is_retried_on_the_next_tick(tmp_path):
     assert len(working.sent) == 1, "the missed alert is delivered late, not lost"
     assert conn.execute(
         "SELECT COUNT(*) FROM notifications WHERE status='pending'").fetchone()[0] == 0
+
+
+async def test_a_broken_channel_does_not_make_the_other_repeat_itself(tmp_path):
+    """Delivery is per channel, because channels do not fall behind together.
+
+    The batch used to be built across all of them, so while Discord was down
+    every tick handed Telegram a second copy of every alert it had already
+    taken: one channel's outage became the other channel's spam.
+    """
+    cfg, conn = setup(tmp_path)
+    chain = FakeChain({A1: [(100_000, []),
+                            (150_000, [transfer("t1", 50_000)]),
+                            (220_000, [transfer("t2", 70_000)])],
+                       A2: [(0, [])]})
+    router = FakeRouter(fail={"telegram": None, "discord": "webhook down"},
+                        channels=("telegram", "discord"))
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+
+    told = "\n".join(m.body for m in router.by_channel["telegram"])
+    assert told.count("0.0005 BTC") == 1, "an alert already taken must not repeat"
+    assert told.count("0.0007 BTC") == 1
+
+    # Discord kept failing, so it is still owed both - and owed them once.
+    assert router.by_channel["discord"][-1].body.count("0.0005 BTC") == 1
+    assert "0.0007 BTC" in router.by_channel["discord"][-1].body
+    assert conn.execute(
+        "SELECT COUNT(*) FROM notifications WHERE status='pending'").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM notifications WHERE channel='telegram' "
+        "AND status='sent'").fetchone()[0] == 2
+
+
+async def test_a_late_first_delivery_is_not_labelled_confirmed(tmp_path):
+    """"↳ confirmed" marks a follow-up to a message this channel already sent.
+
+    It is driven by `resent`, which was a MAX over every pending row of the
+    event. That only differs from one channel's own answer in one place, and it
+    is reachable: a transfer seen in the mempool is sent, confirms, and is
+    requeued for every channel - so its row carries a sent_at while a channel
+    that was down still carries none. The MAX then handed the channel that had
+    never seen the alert a line saying it was confirming its own earlier one.
+    """
+    cfg, conn = setup(tmp_path)
+    chain = FakeChain({A1: [(100_000, []),
+                            (150_000, [transfer("t1", 50_000, height=None)]),
+                            (150_000, [transfer("t1", 50_000, height=800001)])],
+                       A2: [(0, [])]})
+    router = FakeRouter(fail={"telegram": None, "discord": "webhook down"},
+                        channels=("telegram", "discord"))
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    assert "mempool" in router.by_channel["telegram"][-1].body
+
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    assert "confirmed" in router.by_channel["telegram"][-1].body, \
+        "telegram sent this while it was pending; the follow-up is for telegram"
+    assert "confirmed" not in router.by_channel["discord"][-1].body, \
+        "discord is seeing this alert for the first time"
+
+
+async def test_the_queue_reports_its_age_and_its_last_error(tmp_path):
+    """/status and /health used to print "N failed", counting a status nothing
+    ever writes - a number that could only ever read zero. What tells a stuck
+    queue from an idle one is a pending row that keeps getting older, plus the
+    reason the channel gave, which was recorded and never shown."""
+    cfg, conn = setup(tmp_path)
+    chain = FakeChain({A1: [(100_000, []), (150_000, [transfer("t1", 50_000)])],
+                       A2: [(0, [])]})
+    broken = FakeRouter(fail="telegram down")
+    await pipeline.scan_once(cfg, conn, broken, {"bitcoin": chain})
+    await pipeline.scan_once(cfg, conn, broken, {"bitcoin": chain})
+
+    state = pipeline.queue_state(conn)
+    assert state["pending"] == 1
+    assert state["oldest"], "a stuck row has to carry an age"
+    assert state["error"] == "telegram: telegram down"
+
+    await pipeline.scan_once(cfg, conn, FakeRouter(), {"bitcoin": chain})
+    state = pipeline.queue_state(conn)
+    assert state["pending"] == 0
+    assert state["error"] == "", "a cleared outage must stop being reported"
 
 
 async def test_unexplained_balance_move_raises_an_anomaly(tmp_path):
