@@ -211,6 +211,42 @@ async def test_failed_delivery_is_retried_on_the_next_tick(tmp_path):
         "SELECT COUNT(*) FROM notifications WHERE status='pending'").fetchone()[0] == 0
 
 
+def _debt_event(**kw):
+    base = {"kind": "transfer", "direction": "in", "amount_raw": "5000000000",
+            "usd": 5000.0, "counterparty": "0x" + "0" * 40, "status": "confirmed",
+            "detail": None, "scope": "ethereum", "uid": "u1", "label": "main",
+            "chain": "evm", "symbol": "variableDebtUSDC", "decimals": 6,
+            "resent": 0, "asset_kind": "debt"}
+    return dict(base, **kw)
+
+
+def test_a_borrow_is_not_announced_as_money_arriving():
+    """Aave mints the debt token to the borrower, so a borrow reaches the
+    renderer as an incoming ERC-20 transfer from the zero address. Drawn with
+    the ordinary inbound arrow and a dollar figure it read as a $5,000 deposit,
+    which is the opposite of what happened - and the counterparty shown beside
+    it named nobody. It says what _record_debt_change says, because it is the
+    same event by a different route."""
+    body = pipeline.render([_debt_event()]).body
+    assert "borrowed 5000 variableDebtUSDC ($5,000.00)" in body
+    assert "←" not in body and "0x000000" not in body
+
+
+def test_a_repayment_says_so():
+    body = pipeline.render([_debt_event(direction="out")]).body
+    assert "repaid 5000 variableDebtUSDC ($5,000.00)" in body
+    assert "→" not in body
+
+
+def test_an_ordinary_transfer_still_gets_its_arrow_and_counterparty():
+    """The debt branch must not swallow the common case."""
+    body = pipeline.render([_debt_event(
+        symbol="USDC", asset_kind="erc20",
+        counterparty="0xabcdef0123456789abcdef0123456789abcdef01")]).body
+    assert "← 5000 USDC ($5,000.00)" in body
+    assert "0xabcdef…ef01" in body
+
+
 async def test_a_broken_channel_does_not_make_the_other_repeat_itself(tmp_path):
     """Delivery is per channel, because channels do not fall behind together.
 

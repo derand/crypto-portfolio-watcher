@@ -515,10 +515,43 @@ def test_a_table_that_cannot_fit_stays_readable():
     assert "aEthL…" in "\n".join(lines), "a symbol is still recognisable"
 
 
-def _event(kind, symbol, raw, label, usd=None, detail="vault yield", decimals=18):
+def _event(kind, symbol, raw, label, usd=None, detail="vault yield", decimals=18,
+           asset_kind="erc20"):
     return {"kind": kind, "direction": "in", "amount_raw": str(raw), "usd": usd,
             "detail": detail, "ts": "2026-09-05T09:00:00+00:00",
-            "label": label, "symbol": symbol, "decimals": decimals}
+            "label": label, "symbol": symbol, "decimals": decimals,
+            "asset_kind": asset_kind}
+
+
+def _borrow(usd=5000.0):
+    """The two transfers one borrow produces: the cash, and the debt token
+    minted alongside it. Both arrive, both are whitelisted, both are priced."""
+    return [_event("transfer", "USDC", 5 * 10**9, "main", usd, decimals=6),
+            _event("transfer", "variableDebtUSDC", 5 * 10**9, "main", usd,
+                   decimals=6, asset_kind="debt")]
+
+
+def test_a_borrow_is_not_a_day_of_earnings():
+    """A debt token is minted to the borrower, so it arrives as an incoming
+    ERC-20 transfer beside the cash it paid for. Counted at face value, a
+    $5,000 loan read as "net +$10,000" - twice the cash, for a day on which
+    net worth did not move at all."""
+    summary, _ = digest._last24h(_borrow())
+    assert "net $+0.00" in summary, summary
+
+
+def test_a_repayment_is_not_a_day_of_losses():
+    """The mirror: the debt token is burned, so it leaves as an outgoing
+    transfer beside the cash. Signed naively that is -$10,000."""
+    summary, _ = digest._last24h([dict(e, direction="out") for e in _borrow()])
+    assert "net $+0.00" in summary, summary
+
+
+def test_an_ordinary_transfer_keeps_its_plain_sign():
+    """The debt rule must not leak into the common case: money in is income."""
+    summary, _ = digest._last24h(
+        [_event("transfer", "USDC", 5 * 10**9, "main", 5000.0, decimals=6)])
+    assert "net $+5,000.00" in summary, summary
 
 
 def test_the_24h_detail_fits_the_same_screen_as_the_tables():

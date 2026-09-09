@@ -64,6 +64,39 @@ def test_dropped_address_is_disabled_not_deleted(tmp_path):
     assert rows == {"main": 0, "btc": 1}
 
 
+DEBT_CFG = CFG + """  - chain: ethereum
+    contract: "0x72E95b8931767C79bA4EeE721354d6E99a61D004"
+    symbol: variableDebtUSDC
+    decimals: 6
+    coingecko_id: usd-coin
+    debt: true
+"""
+
+
+def test_a_debt_token_is_recorded_as_one(tmp_path):
+    """`kind` is how every reader downstream learns that this token's ERC-20
+    direction is backwards from the money. The schema reserved 'debt' from the
+    start and nothing wrote it, so the digest counted a borrow as earnings."""
+    cfg, conn = make(tmp_path, DEBT_CFG)
+    dbmod.sync_config(conn, cfg)
+    kinds = {r["symbol"]: r["kind"] for r in conn.execute(
+        "SELECT symbol, kind FROM assets")}
+    assert kinds == {"USDC": "erc20", "variableDebtUSDC": "debt"}
+
+
+def test_a_dropped_debt_token_loses_its_whitelist_too(tmp_path):
+    """The sweep that clears the flag was scoped to kind='erc20'. Writing 'debt'
+    would have quietly carried a removed loan in the total forever, priced at
+    today's rate - the exact failure the sweep exists to prevent."""
+    cfg, conn = make(tmp_path, DEBT_CFG)
+    dbmod.sync_config(conn, cfg)
+    cfg.tokens = [t for t in cfg.tokens if not t.debt]
+    dbmod.sync_config(conn, cfg)
+    flags = {r["symbol"]: r["whitelisted"] for r in conn.execute(
+        "SELECT symbol, whitelisted FROM assets")}
+    assert flags == {"USDC": 1, "variableDebtUSDC": 0}
+
+
 def test_event_uniqueness_blocks_duplicate_alerts(tmp_path):
     """The same transfer seen twice by overlapping fetches must not insert twice."""
     cfg, conn = make(tmp_path)

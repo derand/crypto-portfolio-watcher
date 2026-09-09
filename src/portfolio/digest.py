@@ -52,7 +52,7 @@ def collect(conn, prices=None) -> dict:
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     recent = _rows(conn, """
         SELECT e.kind, e.direction, e.amount_raw, e.usd, e.pnl_usd, e.detail, e.ts,
-               a.label, s.symbol, s.decimals
+               a.label, s.symbol, s.decimals, s.kind AS asset_kind
         FROM events e JOIN addresses a ON a.id = e.address_id
         LEFT JOIN assets s ON s.id = e.asset_id
         WHERE e.ts >= ? ORDER BY e.ts""", (since,))
@@ -460,6 +460,21 @@ def _split_groups(rows: list[dict], total: float) -> dict[str, list[dict]]:
     return groups
 
 
+def _net_usd(e: dict) -> float:
+    """What one transfer did to net worth, signed.
+
+    A debt token's direction is backwards from the money: it is minted to the
+    borrower and burned on repayment, so receiving one is a liability taken on
+    rather than income. A $5,000 borrow arrives as two incoming transfers - the
+    cash, and the debt token minted alongside it - and taken at face value the
+    day read "net +$10,000" for something that changed net worth by nothing.
+    """
+    sign = 1 if e["direction"] == Direction.IN.value else -1
+    if e.get("asset_kind") == "debt":
+        sign = -sign
+    return (e["usd"] or 0) * sign
+
+
 def _last24h(recent: list[dict], width: int = TABLE_WIDTH) -> tuple[str, list[str]]:
     """The day in one line, with the detail behind it.
 
@@ -485,8 +500,7 @@ def _last24h(recent: list[dict], width: int = TABLE_WIDTH) -> tuple[str, list[st
         # internal exists precisely so it does not read as money moving.
         external = [e for e in transfers
                     if e["direction"] != Direction.INTERNAL.value]
-        net = sum((e["usd"] or 0) * (1 if e["direction"] == "in" else -1)
-                  for e in external)
+        net = sum(_net_usd(e) for e in external)
         moved = f"{len(transfers)} transfers"
         if len(external) != len(transfers):
             moved += f" ({len(transfers) - len(external)} internal)"

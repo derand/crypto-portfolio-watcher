@@ -425,7 +425,7 @@ def _pending_batch(conn, channel: str) -> list[dict]:
     rows = conn.execute(
         """SELECT e.id, e.kind, e.direction, e.amount_raw, e.counterparty,
                   e.status, e.detail, e.scope, e.uid, e.usd, a.label, a.chain,
-                  s.symbol, s.decimals,
+                  s.symbol, s.decimals, s.kind AS asset_kind,
                   n.sent_at IS NOT NULL AS resent
            FROM notifications n
            JOIN events e ON e.id = n.event_id
@@ -491,8 +491,6 @@ def render(events: list[dict]) -> Message:
             lines.append(f"{'⚠ ' if danger else ''}{e['label']}: {e['detail']}")
             continue
         amount = format_units(int(e["amount_raw"]), e["decimals"] or 0)
-        arrow = ARROW.get(Direction(e["direction"]), "·") if e["direction"] else "·"
-        who = _who(e["counterparty"])
         if e["resent"]:
             tail = "  ↳ confirmed"          # follow-up to a message already sent
         elif e["status"] != "confirmed":
@@ -501,6 +499,20 @@ def render(events: list[dict]) -> Message:
             tail = ""
         where = f"{e['label']}/{e['scope']}" if e["scope"] else e["label"]
         worth = f" (${e['usd']:,.2f})" if e["usd"] else ""
+        if e.get("asset_kind") == "debt":
+            # A debt token is minted to the borrower and burned on repayment, so
+            # the ERC-20 direction is the opposite of what happened to the
+            # money. An arrow pointing in, next to a dollar figure, reads as a
+            # $5,000 deposit when what happened was taking on $5,000 of debt -
+            # and the counterparty is the zero address, which names nobody. Said
+            # with the verb _record_debt_change already uses, so the two paths
+            # that can notice a borrow report it the same way.
+            verb = "borrowed" if e["direction"] == Direction.IN.value else "repaid"
+            lines.append(f"{where}  {verb} {amount} "
+                         f"{e['symbol'] or ''}{worth}{tail}".rstrip())
+            continue
+        arrow = ARROW.get(Direction(e["direction"]), "·") if e["direction"] else "·"
+        who = _who(e["counterparty"])
         lines.append(f"{where}  {arrow} {amount} {e['symbol'] or ''}{worth}  "
                      f"{who}{tail}".rstrip())
     title = "Portfolio: 1 change" if len(events) == 1 else f"Portfolio: {len(events)} changes"

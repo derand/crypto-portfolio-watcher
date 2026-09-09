@@ -289,27 +289,42 @@ def sync_config(conn: sqlite3.Connection, cfg) -> tuple[int, int]:
             conn.execute("UPDATE addresses SET enabled=0")
 
         for t in cfg.tokens:
+            # kind='debt' is how a reader downstream learns that this token's
+            # ERC-20 direction is backwards from the money: it is minted to the
+            # borrower and burned on repayment, so one arriving is a liability
+            # taken on, not income. The schema reserved the value from the
+            # start and nothing ever wrote it, so a borrow reached the digest
+            # as a day's earnings.
             conn.execute(
                 """INSERT INTO assets(asset_key, chain, contract, symbol, decimals,
                                       coingecko_id, kind, whitelisted)
-                   VALUES (?,?,?,?,?,?,'erc20',1)
+                   VALUES (?,?,?,?,?,?,?,1)
                    ON CONFLICT(asset_key) DO UPDATE SET
                      symbol=excluded.symbol, decimals=excluded.decimals,
-                     coingecko_id=excluded.coingecko_id, whitelisted=1""",
-                (t.asset_key, t.chain, t.contract, t.symbol, t.decimals, t.coingecko_id))
+                     coingecko_id=excluded.coingecko_id, kind=excluded.kind,
+                     whitelisted=1""",
+                (t.asset_key, t.chain, t.contract, t.symbol, t.decimals,
+                 t.coingecko_id, "debt" if t.debt else "erc20"))
 
         # The mirror of the addresses rule above: a token dropped from the YAML
         # has to lose its whitelist flag, or its last balance stays frozen in
         # the portfolio total forever, priced at today's rate, removable only
-        # by hand in SQLite. Scoped to erc20 - natives, Hyperliquid coins and
-        # position assets are not whitelist material and were never listed.
+        # by hand in SQLite. Scoped to the kinds that come from the whitelist -
+        # natives, Hyperliquid coins and position assets are not whitelist
+        # material and were never listed. `debt` belongs in that scope as much
+        # as `erc20` does: it is written from this same loop, and leaving it out
+        # would freeze a dropped debt token into the total forever, which is the
+        # exact failure this sweep exists to prevent.
         keys = [t.asset_key for t in cfg.tokens]
+        whitelist_kinds = "('erc20','debt')"
         if keys:
             holes = ",".join("?" for _ in keys)
-            conn.execute(f"UPDATE assets SET whitelisted=0 WHERE kind='erc20' "
+            conn.execute(f"UPDATE assets SET whitelisted=0 "
+                         f"WHERE kind IN {whitelist_kinds} "
                          f"AND asset_key NOT IN ({holes})", keys)
         else:
-            conn.execute("UPDATE assets SET whitelisted=0 WHERE kind='erc20'")
+            conn.execute(f"UPDATE assets SET whitelisted=0 "
+                         f"WHERE kind IN {whitelist_kinds}")
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
