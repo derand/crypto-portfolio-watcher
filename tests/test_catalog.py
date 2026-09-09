@@ -1,4 +1,5 @@
 import json
+import threading
 
 import httpx
 import pytest
@@ -190,6 +191,50 @@ def test_symbols_of_different_lengths_all_decode():
              ("aEthLidoWETHwithAVeryLongName", WETH)]
     assert abi.decode_symbol_address_array(enc_sym_addr_array(pairs)) == [
         (s, a) for s, a in pairs]
+
+
+def _within(seconds, fn, payload):
+    """Run a decoder and fail rather than hang.
+
+    What is guarded here is not a wrong answer but an unbounded loop, and there
+    is no pytest-timeout in this project to notice one: without this the suite
+    would stop instead of reporting.
+    """
+    out = {}
+    worker = threading.Thread(target=lambda: out.setdefault("v", fn(payload)),
+                              daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), f"{fn.__name__} did not finish in {seconds}s"
+    return out["v"]
+
+
+def test_an_array_claiming_more_entries_than_the_payload_holds_is_refused():
+    """A stale catalog address points at a contract answering some other ABI,
+    and `catalog-check` exists to ask exactly those questions. Handed a
+    plausible offset and a huge length word, the decoder walked the count it was
+    given - appending zero addresses until memory ran out. That is neither of
+    the two answers this module is allowed to give, and no caller can catch it.
+    """
+    payload = enc_uint(32, 2 ** 40)
+    assert _within(5, abi.decode_address_array, payload) is None
+    assert _within(5, abi.decode_symbol_address_array, payload) is None
+
+
+def test_a_truncated_array_is_refused_rather_than_padded_with_zeroes():
+    """The quiet half of the same bug: slicing past the end of a bytes object is
+    not an error and int.from_bytes(b"") is zero, so a half-received answer used
+    to decode cleanly into addresses nobody sent. A zero address means
+    "unconfigured" everywhere else in this module, so the result read as a
+    market listing nothing rather than as a read that failed."""
+    promised_three_sent_one = enc_uint(32, 3, int(AWETH, 16))
+    assert abi.decode_address_array(promised_three_sent_one) is None
+
+
+def test_a_well_formed_array_is_still_read_whole():
+    """The refusals above must not cost the answer they exist to protect."""
+    assert abi.decode_address_array(enc_addr_array([AWETH, AUSDC])) == [AWETH, AUSDC]
+    assert abi.decode_address_array(enc_addr_array([])) == []
 
 
 def test_a_reverting_call_decodes_to_none_rather_than_raising():

@@ -36,7 +36,35 @@ def _body(data) -> bytes | None:
 
 
 def _word(b: bytes, at: int) -> int:
+    """One 32-byte word, or IndexError.
+
+    Refusing is the point. Slicing a bytes object past its end is not an error
+    in Python and int.from_bytes(b"") is 0, so reading out of range used to
+    answer zero - which turned every payload of an unexpected shape into
+    plausible data instead of a refusal: an offset pointing nowhere read as
+    zero, a length word past the end read as "empty", and a truncated answer
+    decoded to a clean, wrong result. Every caller below already turns this
+    into None, which is what the module promises.
+    """
+    if at < 0 or at + WORD > len(b):
+        raise IndexError(f"word at {at} lies outside a {len(b)}-byte payload")
     return int.from_bytes(b[at:at + WORD], "big")
+
+
+def _counted(b: bytes, at: int) -> int:
+    """The length word of a dynamic array, sized against what could hold it.
+
+    An array claiming more entries than the payload has bytes is not an array;
+    without this the loops below spun on a plausible-looking offset and a huge
+    length word, appending zero addresses until memory ran out. That answered
+    neither None nor an exception - the two things this module is allowed to do
+    - and it was reachable from `catalog-check`, where a stale entry points at a
+    contract that answers some other ABI entirely.
+    """
+    count = _word(b, at)
+    if count * WORD > len(b):
+        raise IndexError(f"{count} entries cannot fit in {len(b)} bytes")
+    return count
 
 
 def decode_uint(data) -> int | None:
@@ -84,7 +112,7 @@ def decode_address_array(data) -> list[str] | None:
         return None
     try:
         head = _word(b, 0)
-        count = _word(b, head)
+        count = _counted(b, head)
         out = []
         for i in range(count):
             out.append(f"0x{_word(b, head + WORD + i * WORD):040x}")
@@ -125,7 +153,7 @@ def decode_symbol_address_array(data) -> list[tuple[str, str]] | None:
         return None
     try:
         head = _word(b, 0)
-        count = _word(b, head)
+        count = _counted(b, head)
         base = head + WORD
         out = []
         for i in range(count):
