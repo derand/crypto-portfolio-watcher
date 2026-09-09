@@ -9,7 +9,6 @@ import asyncio
 import logging
 
 from ..models import Message
-from ..retry import with_retry
 from .telegram import TelegramNotifier
 
 log = logging.getLogger(__name__)
@@ -40,7 +39,10 @@ class Router:
         """
         async def one(n):
             try:
-                await with_retry(lambda: n.send(msg), what=f"{n.name} send")
+                # No retry here on purpose: a Message may be several requests,
+                # and only the notifier knows where the boundaries are. Retrying
+                # at this level re-sent the parts that had already arrived.
+                await n.send(msg)
                 return n.name, None
             except Exception as e:  # noqa: BLE001
                 log.error("%s delivery failed: %s", n.name, e)

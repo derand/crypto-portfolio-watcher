@@ -17,7 +17,7 @@ import logging
 import httpx
 
 from ..models import Block, Message, Severity
-from ..retry import Permanent
+from ..retry import Permanent, with_retry
 
 log = logging.getLogger(__name__)
 
@@ -102,10 +102,24 @@ class TelegramNotifier:
 
     async def send(self, msg: Message, chat_id: str | None = None) -> None:
         """Deliver msg. `chat_id` overrides the configured chat, which is how a
-        reply goes back to whoever asked rather than to the alert channel."""
+        reply goes back to whoever asked rather than to the alert channel.
+
+        Each part is retried on its own. Retrying the whole message instead -
+        which is what the router used to do - re-sends the parts that already
+        arrived: one 500 on part two of three put the header and part one in the
+        chat a second time, and still reported success. A part that fails every
+        attempt raises, and the notification rows stay pending, so the next tick
+        tries the message again; that repeats a delivered part at most once,
+        against losing the alert entirely.
+        """
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            for text in self.texts(msg):
-                await send_text(client, self._token, chat_id or self._chat, text)
+            parts = self.texts(msg)
+            for i, text in enumerate(parts, 1):
+                what = "telegram send" if len(parts) == 1 else f"telegram send {i}/{len(parts)}"
+                await with_retry(
+                    lambda text=text: send_text(client, self._token,
+                                                chat_id or self._chat, text),
+                    what=what)
 
 
 async def api(client, token: str, method: str, payload: dict) -> dict:

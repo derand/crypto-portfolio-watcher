@@ -1,3 +1,6 @@
+import json
+
+import httpx
 import pytest
 
 from portfolio.models import Block, Message
@@ -27,17 +30,72 @@ async def test_one_dead_channel_does_not_suppress_the_others():
     assert ok.calls == 1
 
 
-async def test_permanent_errors_are_not_retried():
-    n = Fake("telegram", Permanent("401 unauthorized"))
-    await Router([n]).send(Message(title="t", body="b"))
-    assert n.calls == 1, "bad credentials will not become good on attempt 2"
-
-
-async def test_transient_errors_are_retried_then_reported():
+async def test_the_router_asks_each_channel_exactly_once():
+    """Retrying belongs to the notifier, not here. A Message is not always one
+    request - Telegram splits a long digest - so a retry at this level re-sends
+    the parts that already arrived. The router fans out and reports."""
     n = Fake("telegram", RuntimeError("503"))
     results = await Router([n]).send(Message(title="t", body="b"))
-    assert n.calls == 3
+    assert n.calls == 1, "the router must not turn one failure into three sends"
     assert "503" in results["telegram"]
+
+
+async def test_a_failure_part_way_through_does_not_resend_what_arrived(monkeypatch):
+    """One transient 500 on a later part used to re-deliver every part before it
+    - and the router still reported success, because the whole send was the unit
+    of retry. Counted per line, because two parts of one digest legitimately
+    share a prefix; what must never happen is a line arriving twice."""
+    delivered, attempts = [], {"n": 0}
+    rows = [f"row-{i:03d} " + "x" * 55 for i in range(120)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        text = json.loads(request.content)["text"]
+        if rows[-1][:7] in text:              # the final part, whichever it is
+            attempts["n"] += 1
+            if attempts["n"] == 1:            # fails once, then succeeds
+                return httpx.Response(500, text="upstream hiccup")
+        delivered.append(text)
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+    monkeypatch.setattr("portfolio.notify.telegram.httpx.AsyncClient",
+                        lambda *a, **k: real(*a, **dict(k, transport=transport)))
+
+    msg = Message(title="Portfolio", body="\n".join(rows))
+    notifier = TelegramNotifier("tok", "chat")
+    assert len(notifier.texts(msg)) > 1, "this test needs a message that splits"
+
+    results = await Router([notifier]).send(msg)
+    assert results["telegram"] is None
+    assert attempts["n"] == 2, "the failing part is the part that gets retried"
+    for row in rows:
+        seen = sum(t.count(row[:7]) for t in delivered)
+        assert seen == 1, f"{row[:7]} reached the chat {seen} times"
+    assert sum(t.count("<b>Portfolio</b>") for t in delivered) == 1
+
+
+async def test_a_permanent_refusal_stops_that_message_at_once():
+    """400 and 401 do not become 200 on attempt two, and each wasted attempt is
+    a message Telegram may rate-limit the next real alert for."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(401, text="unauthorized")
+
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+    import portfolio.notify.telegram as tg
+    original = tg.httpx.AsyncClient
+    tg.httpx.AsyncClient = lambda *a, **k: real(*a, **dict(k, transport=transport))
+    try:
+        results = await Router([TelegramNotifier("tok", "chat")]).send(
+            Message(title="t", body="b"))
+    finally:
+        tg.httpx.AsyncClient = original
+    assert calls["n"] == 1, "bad credentials will not become good on attempt 2"
+    assert "401" in results["telegram"]
 
 
 async def test_with_retry_returns_first_success():
