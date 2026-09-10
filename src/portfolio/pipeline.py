@@ -561,6 +561,19 @@ def _fmt(amount_raw: int, decimals: int) -> str:
 
 
 def _upsert_position(conn, address_id: int, p, asset_id: int | None) -> None:
+    """Store the position, and append to its history when it actually moved.
+
+    The state row is overwritten in place, so the history is a table of its
+    own: quantities are the one part of the portfolio that no provider can
+    hand back later, while prices are recorded independently and a value is
+    the two multiplied.
+    """
+    previous = conn.execute(
+        """SELECT amount_raw, extra FROM positions
+            WHERE address_id=? AND protocol=? AND position_key=?""",
+        (address_id, p.protocol, p.key)).fetchone()
+    extra = json.dumps(p.extra)
+    now = _now()
     conn.execute(
         """INSERT INTO positions(address_id, protocol, position_key, asset_id,
                                  amount_raw, usd, extra, updated_at)
@@ -569,7 +582,38 @@ def _upsert_position(conn, address_id: int, p, asset_id: int | None) -> None:
              asset_id=excluded.asset_id, amount_raw=excluded.amount_raw,
              usd=excluded.usd, extra=excluded.extra, updated_at=excluded.updated_at""",
         (address_id, p.protocol, p.key, asset_id, str(p.amount_raw), p.usd,
-         json.dumps(p.extra), _now()))
+         extra, now))
+    if previous is None or _position_moved(previous, p.amount_raw, p.extra):
+        _record_position_snapshot(conn, address_id, p.protocol, p.key, asset_id,
+                                  p.amount_raw, p.usd, extra, now)
+
+
+def _position_moved(previous, amount_raw: int, extra: dict) -> bool:
+    """Whether this position is worth another row of history.
+
+    The amount, for everything that holds a quantity. For a leveraged position
+    also its unrealised PnL: a perp's size sits unchanged for weeks while what
+    it is worth moves every tick, and that number is the one thing here that
+    cannot be recomputed afterwards from a price - it needs the entry price the
+    venue reported at the time. Recording on change rather than on every tick
+    is what keeps this table smaller than `balance_snapshots`, which writes a
+    row per fetched asset whether or not it moved.
+    """
+    if int(previous["amount_raw"] or 0) != amount_raw:
+        return True
+    if not extra.get("side"):
+        return False
+    return _extra(previous).get("unrealized_pnl") != extra.get("unrealized_pnl")
+
+
+def _record_position_snapshot(conn, address_id: int, protocol: str, key: str,
+                              asset_id: int | None, amount_raw: int,
+                              usd: float | None, extra: str, ts: str) -> None:
+    conn.execute(
+        """INSERT INTO position_snapshots(address_id, protocol, position_key,
+                                          asset_id, amount_raw, usd, extra, ts)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (address_id, protocol, key, asset_id, str(amount_raw), usd, extra, ts))
 
 
 def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
@@ -629,8 +673,8 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
     baseline = cursor.is_fresh
 
     previous = {r["position_key"]: r for r in conn.execute(
-        """SELECT p.position_key, p.amount_raw, p.extra, s.decimals, s.symbol,
-                  s.asset_key
+        """SELECT p.position_key, p.amount_raw, p.extra, p.asset_id, s.decimals,
+                  s.symbol, s.asset_key
              FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
             WHERE p.address_id=? AND p.protocol=?""",
         (address_id, source.name))}
@@ -715,6 +759,12 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
         for key, row in previous.items():
             if key in seen or key == "account":
                 continue
+            # Zero before the delete, and unconditionally: a position that is
+            # gone from the state table but whose history stops at its last
+            # size reads, to anything carrying the last known value forward, as
+            # still being held - forever. The terminal row is what ends it.
+            _record_position_snapshot(conn, address_id, source.name, key,
+                                      row["asset_id"], 0, None, row["extra"], _now())
             conn.execute("DELETE FROM positions WHERE address_id=? AND protocol=? "
                          "AND position_key=?", (address_id, source.name, key))
             if baseline:

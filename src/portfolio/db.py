@@ -13,7 +13,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -129,6 +129,41 @@ CREATE TABLE IF NOT EXISTS positions (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (address_id, protocol, position_key)
 );
+
+-- What `positions` overwrites. That table is keyed by the position, so every
+-- tick replaces the last one and a closed position is deleted outright: the
+-- quantities were the one part of the portfolio with no history anywhere, and
+-- unlike prices they cannot be recovered from any provider afterwards. Keyed
+-- (address_id, protocol, position_key, ts) rather than by asset, because a
+-- position may have no asset at all - "staking:pending" is a bucket, not a coin.
+-- `usd` is copied from the position as it stood and is point-in-time, not a
+-- series: for a perp it is a notional and for "account" the exchange's own
+-- account value. What a chart wants is amount_raw carried forward times the
+-- price series, and for a leveraged position `extra.unrealized_pnl`.
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    id           INTEGER PRIMARY KEY,
+    address_id   INTEGER NOT NULL REFERENCES addresses(id),
+    protocol     TEXT NOT NULL,
+    position_key TEXT NOT NULL,
+    asset_id     INTEGER REFERENCES assets(id),
+    amount_raw   TEXT NOT NULL,
+    usd          REAL,
+    extra        TEXT,
+    ts           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_ts ON position_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_key
+    ON position_snapshots(address_id, protocol, position_key, ts);
+
+-- One row per delivered digest: the daily total as a series instead of the
+-- single overwritten `meta: digest:last_total`. `unpriced` rides along because
+-- a dip caused by a provider not quoting an asset must be readable as that
+-- rather than as a loss.
+CREATE TABLE IF NOT EXISTS total_snapshots (
+    ts       TEXT PRIMARY KEY,
+    usd      REAL NOT NULL,
+    unpriced INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -223,7 +258,32 @@ def _v4_to_v5(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE events ADD COLUMN pnl_usd REAL")
 
 
-MIGRATIONS = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4, 4: _v4_to_v5}
+def _v5_to_v6(conn: sqlite3.Connection) -> None:
+    """History for positions and for the daily total.
+
+    Both tables are in SCHEMA and so already exist by the time this runs; what
+    the migration is for is the seed. Every position currently held gets one
+    row stamped with its `updated_at`, and the last digest total becomes the
+    first point of the series - otherwise history on an existing database
+    starts empty and the first chart has nothing to draw until tomorrow.
+    """
+    conn.execute(
+        """INSERT INTO position_snapshots(address_id, protocol, position_key,
+                                          asset_id, amount_raw, usd, extra, ts)
+           SELECT address_id, protocol, position_key, asset_id, amount_raw, usd,
+                  extra, updated_at FROM positions""")
+    total = get_meta(conn, "digest:last_total")
+    stamp = get_meta(conn, "digest:last_date")
+    if total is not None and stamp is not None:
+        try:
+            conn.execute(
+                "INSERT INTO total_snapshots(ts, usd, unpriced) VALUES (?,?,0)",
+                (f"{stamp}T00:00:00+00:00", float(total)))
+        except ValueError:
+            log.warning("digest:last_total is not a number, series starts empty")
+
+
+MIGRATIONS = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4, 4: _v4_to_v5, 5: _v5_to_v6}
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default=None):

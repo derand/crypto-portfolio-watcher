@@ -5,7 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A read-only crypto portfolio watcher: it polls addresses, records what changed, and
 notifies. No private keys, no signing, ever. `docs/PLAN.md` is the design record and
 carries the *why* behind most decisions here — read it before proposing architecture
-changes, and update it when a decision turns out wrong (several already have).
+changes, and update it when a decision turns out wrong (several already have). Open work
+lives in `docs/todo.md` instead: PLAN records what was decided and what it cost to learn,
+todo records what is left. A finished item leaves todo, and earns a dated section in PLAN
+only if it carries a lesson.
 
 ## Commands
 
@@ -167,6 +170,19 @@ years of history as notifications. A cursor never parks on an **unconfirmed** it
 walk stops at `last_item`, so a pending transaction used as the marker becomes the wall
 the moment it confirms, and the pending→confirmed requeue dies. Re-reading a few
 transactions costs nothing — events deduplicate by uid.
+
+**A quantity nobody wrote down is gone.** Prices are recorded on their own schedule, so a
+historical value is two carried-forward series multiplied — which leaves the quantities as
+the only irrecoverable half. `positions` is a state row keyed by the position: it is
+overwritten every tick and deleted outright on close, so history lives in
+`position_snapshots`, keyed `(address_id, protocol, position_key, ts)` because a position
+may carry no `asset_id` at all — a staking bucket is not a coin. A row is written when the
+amount moved, or, for a position carrying a `side`, when its unrealised PnL did: a
+leveraged position's size sits unchanged for weeks while what it is worth moves every tick,
+and that number needs the entry price as the venue reported it at the time. **A closed
+position gets a terminal row of zero, before the DELETE**, or every reader carrying the
+last value forward holds it forever. `total_snapshots` is the same idea for the daily
+total: one row per *delivered* digest, written in the transaction that moves the baseline.
 
 **Events vs notifications are separate tables** so a crash between recording and sending
 loses nothing; the next tick delivers what is still pending. Delivery happens once, at the

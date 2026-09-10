@@ -1303,3 +1303,64 @@ async def test_a_source_without_the_hook_is_never_asked(tmp_path):
 
     assert "closed perp:ETH" in router.sent[0].body
     assert pnl_column(conn) == [None]
+
+
+async def _history(conn, key):
+    return [r["amount_raw"] for r in conn.execute(
+        "SELECT amount_raw FROM position_snapshots WHERE position_key=? ORDER BY id",
+        (key,))]
+
+
+async def test_position_history_keeps_what_the_state_row_overwrites(tmp_path):
+    """`positions` is keyed by the position, so every tick replaces the last
+    one and the quantities were the only part of the portfolio with no trail
+    anywhere. Prices are recorded independently and a value is the two
+    multiplied - but a quantity nobody wrote down is gone, and no provider will
+    answer what it was last Tuesday."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), spot(amount=4782113549)],
+                      [account(), spot(amount=5000000000)],
+                      [account(), spot(amount=5000000000)]])   # unchanged tick
+    router = FakeRouter()
+    for _ in range(3):
+        await run_hl(cfg, conn, router, src)
+
+    assert await _history(conn, "spot:USDC") == ["4782113549", "5000000000"]
+    assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='spot:USDC'"
+                        ).fetchone()[0] == 1, "the state row is still one row"
+
+
+async def test_a_perp_that_moved_only_in_pnl_is_still_recorded(tmp_path):
+    """A perp's size sits unchanged for weeks while what it is worth moves with
+    the mark price, and that number cannot be recomputed later from a price
+    series: it needs the entry price as the venue reported it at the time. A
+    quantity that did not move earns no row; this one does."""
+    cfg, conn = setup_hl(tmp_path)
+
+    def scripted(hype, pnl):
+        p = perp()
+        p.extra["unrealized_pnl"] = pnl
+        return [account(), spot("USDC", 100), spot("HYPE", hype), p]
+
+    src = FakeSource([scripted(5, "1.0"), scripted(7, "2.0")])
+    router = FakeRouter()
+    for _ in range(2):
+        await run_hl(cfg, conn, router, src)
+
+    assert await _history(conn, "spot:USDC") == ["100"], "an untouched balance"
+    assert len(await _history(conn, "perp:ETH")) == 2
+
+
+async def test_a_closed_position_ends_its_history_at_zero(tmp_path):
+    """The row is deleted on close, so history that stopped at the last size
+    would read - to anything carrying the last known value forward, which is
+    what a chart does - as the position still being held, forever."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), perp(size=150000000)], [account()]])
+    router = FakeRouter()
+    for _ in range(2):
+        await run_hl(cfg, conn, router, src)
+
+    assert await _history(conn, "perp:ETH") == ["150000000", "0"]
+    assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='perp:ETH'"
+                        ).fetchone()[0] == 0

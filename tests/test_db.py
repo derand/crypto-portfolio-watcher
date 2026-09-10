@@ -231,3 +231,49 @@ def test_a_v4_database_gains_the_realised_pnl_column(tmp_path):
     row = conn.execute("SELECT detail, pnl_usd FROM events").fetchone()
     assert row["detail"] == "closed perp:ETH (1.5)"
     assert row["pnl_usd"] is None
+
+
+def test_a_v5_database_seeds_history_from_what_it_already_holds(tmp_path):
+    """History that starts empty starts tomorrow. The positions a database
+    already carries are a real observation with a timestamp on it, and the last
+    digest total is a real day - both belong in the series rather than being
+    thrown away for the sake of a clean start."""
+    cfg, conn = make(tmp_path)
+    dbmod.sync_config(conn, cfg)
+    conn.executescript("""
+        DROP TABLE position_snapshots;
+        DROP TABLE total_snapshots;
+        UPDATE schema_version SET version=5;
+    """)
+    aid = conn.execute("SELECT id FROM addresses LIMIT 1").fetchone()[0]
+    conn.execute("""INSERT INTO positions(address_id, protocol, position_key,
+                                          amount_raw, usd, extra, updated_at)
+                    VALUES (?, 'beacon', 'validator:1', '32004002371000000000',
+                            NULL, '{}', '2026-09-08T07:00:00+00:00')""", (aid,))
+    dbmod.set_meta(conn, "digest:last_total", "188417.00")
+    dbmod.set_meta(conn, "digest:last_date", "2026-09-09")
+
+    dbmod.init(conn)
+
+    assert conn.execute(
+        "SELECT version FROM schema_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+    row = conn.execute("SELECT position_key, amount_raw, ts FROM position_snapshots"
+                       ).fetchone()
+    assert (row["position_key"], int(row["amount_raw"]), row["ts"]) == (
+        "validator:1", 32004002371000000000, "2026-09-08T07:00:00+00:00")
+    assert conn.execute("SELECT usd FROM total_snapshots").fetchone()[0] == 188417.00
+
+
+def test_seeding_history_survives_a_database_with_no_digest_yet(tmp_path):
+    """A fresh install has no last total to seed from, and a migration that
+    assumed one would refuse to run at all."""
+    cfg, conn = make(tmp_path)
+    conn.executescript("""
+        DROP TABLE position_snapshots;
+        DROP TABLE total_snapshots;
+        UPDATE schema_version SET version=5;
+    """)
+
+    dbmod.init(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM total_snapshots").fetchone()[0] == 0

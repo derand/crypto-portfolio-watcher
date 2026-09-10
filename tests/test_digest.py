@@ -456,6 +456,8 @@ async def test_a_digest_nobody_received_is_not_recorded_as_the_new_baseline(setu
     assert results == {"telegram": "timeout"}
     assert dbmod.get_meta(conn, digest.LAST_TOTAL) is None
     assert dbmod.get_meta(conn, digest.LAST_DATE) is None, "due() must stay true"
+    assert conn.execute("SELECT COUNT(*) FROM total_snapshots").fetchone()[0] == 0, \
+        "the series records days that happened, and this one did not"
 
 
 async def test_a_delivered_digest_does_record_the_baseline(setup):
@@ -470,6 +472,27 @@ async def test_a_delivered_digest_does_record_the_baseline(setup):
     _, results = await digest.send(cfg, conn, Live(), Prices({"bitcoin:native": 77000.0}))
     assert results == {"telegram": None}
     assert dbmod.get_meta(conn, digest.LAST_TOTAL) == "38500.00"
+
+
+async def test_each_delivered_digest_adds_a_point_to_the_total_series(setup):
+    """`meta` holds one number and forgets yesterday's. A day of the portfolio's
+    value that was never written down cannot be recovered from anywhere later,
+    which is why the row is appended rather than overwritten - and why it counts
+    the unpriced holdings beside it: a total that dipped because CoinGecko was
+    silent must not read as money lost."""
+    cfg, conn, _, _ = setup
+
+    class Live:
+        channels = ["telegram"]
+
+        async def send(self, msg):
+            return {"telegram": None}
+
+    await digest.send(cfg, conn, Live(), Prices({"bitcoin:native": 77000.0}))
+    await digest.send(cfg, conn, Live(), Prices({}))       # nobody quoted BTC
+
+    rows = conn.execute("SELECT usd, unpriced FROM total_snapshots ORDER BY ts").fetchall()
+    assert [(r["usd"], r["unpriced"]) for r in rows] == [(38500.0, 0), (0.0, 1)]
 
 
 def _row(qty_raw, decimals, symbol, where, usd):

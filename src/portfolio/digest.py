@@ -746,6 +746,16 @@ async def send(cfg, conn, router, prices=None) -> tuple[Message, dict]:
     try:
         dbmod.set_meta(conn, LAST_TOTAL, f"{data['total']:.2f}")
         dbmod.set_meta(conn, LAST_DATE, date.today().isoformat())
+        # The same number, kept instead of overwritten: one row a day is the
+        # series a chart wants first, and it is also the cross-check on a total
+        # rebuilt from quantities and prices. In this transaction deliberately,
+        # so it inherits the rule above - a total nobody received is not a day.
+        conn.execute(
+            "INSERT INTO total_snapshots(ts, usd, unpriced) VALUES (?,?,?) "
+            "ON CONFLICT(ts) DO UPDATE SET usd=excluded.usd, "
+            "unpriced=excluded.unpriced",
+            (datetime.now(timezone.utc).isoformat(), data["total"],
+             data["unpriced"]))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
