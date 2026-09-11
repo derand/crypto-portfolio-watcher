@@ -174,6 +174,28 @@ def test_digest_shows_claim_worthy_lp_fees(setup):
     assert "main uniswap-v3 #42  $63.50" in body
 
 
+def test_a_claim_line_names_the_leg_it_could_not_price(setup):
+    """A position is claimed in both its assets at once, so the leg with no
+    quote belongs in the line. Printing only the dollars would report $12 of
+    claimable fees next to an unnamed amount of the other token."""
+    cfg, conn, _, _ = setup
+    claim = {"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
+             "token_id": 42, "usd": 12.0, "unpriced": ["7 NEWCOIN"]}
+    data = digest.collect(conn, Prices({"bitcoin:native": 77000.0}), [claim])
+
+    body = digest.render(conn, data, cfg).body
+    assert "main uniswap-v3 #42  $12.00 + 7 NEWCOIN (unpriced)" in body
+
+
+def test_a_claim_line_with_nothing_priced_still_says_what_is_there(setup):
+    cfg, conn, _, _ = setup
+    claim = {"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
+             "token_id": 42, "usd": 0.0, "unpriced": ["7 NEWCOIN"]}
+    data = digest.collect(conn, Prices({"bitcoin:native": 77000.0}), [claim])
+
+    assert "main uniswap-v3 #42  7 NEWCOIN (unpriced)" in digest.render(conn, data, cfg).body
+
+
 def test_disabled_digest_never_fires(setup):
     cfg, conn, _, _ = setup
     cfg.digest.enabled = False

@@ -723,11 +723,23 @@ def render(conn, data: dict, cfg=None) -> Message:
         blocks.append(Block(lines=detail, collapsed=True))
     claims = data.get("claim_reminders", [])
     if claims:
-        lines = [f"{row['label']} {row['venue']} #{row['token_id']}  "
-                 f"${row['usd']:,.2f}" for row in claims]
-        blocks.append(Block(title="LP fees ready to claim", lines=lines))
+        blocks.append(Block(title="LP fees ready to claim",
+                            lines=[_claim_line(row) for row in claims]))
     return Message(title="Daily digest", body=flatten(blocks), blocks=blocks,
                    severity=Severity.LOW, kind=EventKind.SERVICE)
+
+
+def _claim_line(row: dict) -> str:
+    """One claim reminder, saying what it could not price.
+
+    A range position is claimed in both its assets at once, so a leg nobody
+    has quoted is part of the answer rather than a reason to stay quiet - it
+    is named with its amount, next to whatever the other leg is worth.
+    """
+    unpriced = row.get("unpriced") or []
+    parts = [f"${row['usd']:,.2f}"] if row["usd"] or not unpriced else []
+    parts += [f"{name} (unpriced)" for name in unpriced]
+    return f"{row['label']} {row['venue']} #{row['token_id']}  " + " + ".join(parts)
 
 
 async def send(cfg, conn, router, prices=None,

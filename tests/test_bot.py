@@ -130,9 +130,10 @@ def setup(tmp_path):
     return cfg, conn
 
 
-def make(setup, tg, scan=None, prices=None):
+def make(setup, tg, scan=None, prices=None, sources=None):
     cfg, conn = setup
-    return botmod.CommandBot(cfg, conn, prices or Prices(), scan=scan, client=tg.client())
+    return botmod.CommandBot(cfg, conn, prices or Prices(), scan=scan,
+                             sources=sources, client=tg.client())
 
 
 async def test_a_message_from_another_chat_is_never_answered(setup):
@@ -165,6 +166,54 @@ async def test_digest_on_demand_does_not_move_the_daily_baseline(setup):
     assert await bot.handle(update("/digest")) == "digest"
     assert dbmod.get_meta(conn, "digest:last_date") is None
     assert dbmod.get_meta(conn, "digest:last_total") is None
+
+
+class FeeSource:
+    """A position source that can answer what `collect()` would pay."""
+
+    def __init__(self):
+        self.reads = 0
+
+    async def claimable_fees(self, t, wanted):
+        self.reads += 1
+        return {}
+
+
+def add_lp_position(conn) -> None:
+    conn.execute("""INSERT INTO positions(address_id, protocol, position_key,
+                                          asset_id, amount_raw, extra, updated_at)
+                    SELECT a.id, 'univ3', 'ethereum:42:0', s.id, '1',
+                           '{"venue":"uniswap-v3"}', '2026-01-01'
+                      FROM addresses a, assets s LIMIT 1""")
+
+
+async def test_digest_on_demand_carries_the_claim_reminders(setup):
+    """/digest must render what `pw digest` renders. A section that appears in
+    the morning message and silently vanishes on the phone makes the reader
+    trust neither."""
+    cfg, conn = setup
+    tg = Telegram()
+    src = FeeSource()
+    bot = make(setup, tg, sources={"univ3": src})
+    add_lp_position(conn)
+
+    assert await bot.handle(update("/digest")) == "digest"
+    assert src.reads == 1, "the block is missing unless the fees are read"
+
+
+async def test_repeated_digest_taps_do_not_reread_the_fees(setup):
+    """One tap is one simulated collect() per position NFT. Refresh sits under
+    every answer, so an untimed read pays that again for numbers that move by
+    cents."""
+    cfg, conn = setup
+    tg = Telegram()
+    src = FeeSource()
+    bot = make(setup, tg, sources={"univ3": src})
+    add_lp_position(conn)
+
+    await bot.handle(update("/digest"))
+    await bot.handle(update("/digest"))
+    assert src.reads == 1
 
 
 async def test_the_bot_name_suffix_used_in_groups_is_stripped(setup):

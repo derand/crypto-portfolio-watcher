@@ -55,6 +55,13 @@ which this code otherwise reads as Permanent, so it has to be told apart from
 the refusals that really do owe the chat a message."""
 MIN_SCAN_GAP = 60.0
 
+CLAIM_TTL = 900.0
+"""How long a /digest tap may reuse the last LP fee read. Uncollected fees are
+one simulated `collect()` per position NFT - 35 calls on the measured portfolio,
+plus CALL_PACE sleeping - and Refresh is one thumb away, so the untimed version
+pays that again for numbers that move by cents. Same argument as
+`prices.command_ttl_minutes`, and the loop's own daily read is unaffected."""
+
 HELP = [
     ("portfolio", "what is held now, at today's prices"),
     ("digest", "the daily summary on demand (records nothing)"),
@@ -243,12 +250,13 @@ class CommandBot:
     so /scan must be the same serialized call the schedule uses.
     """
 
-    def __init__(self, cfg, conn, prices, *, scan=None, client=None,
+    def __init__(self, cfg, conn, prices, *, scan=None, sources=None, client=None,
                  poll_timeout: int = POLL_TIMEOUT):
         self._cfg = cfg
         self._conn = conn
         self._prices = prices
         self._scan = scan
+        self._sources = sources
         self._token = cfg.notify.telegram.bot_token
         self._chat = str(cfg.notify.telegram.chat_id)
         self._poll_timeout = poll_timeout
@@ -257,6 +265,8 @@ class CommandBot:
         self._owns_client = client is None
         self._render = TelegramNotifier(self._token, self._chat)
         self._offset: int | None = None
+        self._claims: list[dict] = []
+        self._claims_at: float | None = None
         self._last_scan: float | None = None
         """None, not 0.0: time.monotonic() counts from the start of the
         process inside a container, so a zero marker is indistinguishable from
@@ -494,8 +504,25 @@ class CommandBot:
         "change since yesterday".
         """
         await self._fresh_prices()
-        return digest.render(self._conn, digest.collect(self._conn, self._prices),
-                             self._cfg)
+        data = digest.collect(self._conn, self._prices, await self._fees())
+        return digest.render(self._conn, data, self._cfg)
+
+    async def _fees(self) -> list[dict]:
+        """The claim reminders this answer carries, at CLAIM_TTL.
+
+        The block belongs here because /digest renders what the CLI renders -
+        a summary that silently omits a section on the phone is a summary the
+        reader cannot trust. `claim_reminders` returns [] rather than raising,
+        so a provider being down costs this answer the block and nothing else.
+        """
+        if not self._sources:
+            return []
+        now = time.monotonic()
+        if self._claims_at is None or now - self._claims_at >= CLAIM_TTL:
+            self._claims = await pipeline.claim_reminders(
+                self._cfg, self._conn, self._sources, self._prices)
+            self._claims_at = now
+        return self._claims
 
     async def _scan_now(self) -> Message:
         if self._scan is None:

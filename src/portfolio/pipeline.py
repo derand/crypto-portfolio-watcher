@@ -292,6 +292,21 @@ async def scan_once(cfg, conn, router, adapters, sources=None, prices=None) -> S
 
 
 async def claim_reminders(cfg, conn, sources, prices=None) -> list[dict]:
+    """The daily claim reminder, which can never cost the digest its delivery.
+
+    Everything below is a convenience on top of the digest: the numbers it
+    carries are worth saying, and none of them are worth the morning message
+    not arriving. Delivery is what `digest.send` guards its baseline on, so a
+    failure here has to end as an empty list rather than an exception.
+    """
+    try:
+        return await _claim_reminders(cfg, conn, sources, prices)
+    except Exception:  # noqa: BLE001 - a digest must survive a fee-read failure
+        log.exception("daily LP fee reminder failed")
+        return []
+
+
+async def _claim_reminders(cfg, conn, sources, prices=None) -> list[dict]:
     """Price daily Uni v3 fee reads and retain only claim-worthy positions.
 
     The regular position scan has already established which NFTs are open and
@@ -306,7 +321,7 @@ async def claim_reminders(cfg, conn, sources, prices=None) -> list[dict]:
 
     rows = conn.execute("""
         SELECT a.id AS address_id, a.address, a.label, p.position_key, p.extra,
-               s.asset_key, s.decimals
+               s.asset_key, s.symbol, s.decimals
           FROM positions p
           JOIN addresses a ON a.id=p.address_id
           JOIN assets s ON s.id=p.asset_id
@@ -338,32 +353,35 @@ async def claim_reminders(cfg, conn, sources, prices=None) -> list[dict]:
                         watch=frozenset(("univ3",)), chains=())
         try:
             fees = await read_fees(target, requested)
-        except Exception:  # noqa: BLE001 - a digest must survive a fee-read failure
+        except Exception:  # noqa: BLE001 - one address must not cost the others
             log.exception("%s/univ3: daily LP fee read failed", first["label"])
             continue
 
-        totals: dict[tuple[str, str, int], float | None] = {}
+        totals: dict[tuple[str, str, int], dict] = {}
         for (chain, venue, token_id, leg), row in parsed:
             raw = fees.get((chain, venue, token_id))
-            if raw is None:
+            if raw is None or leg >= len(raw):
                 continue
             amount = raw[leg]
-            key = (chain, venue, token_id)
+            slot = totals.setdefault((chain, venue, token_id),
+                                     {"usd": 0.0, "unpriced": []})
             if not amount:
-                totals.setdefault(key, 0.0)
                 continue
-            value = (_usd_of(prices, row["asset_key"], amount, row["decimals"])
-                     if prices else None)
+            value = _usd_of(prices, row["asset_key"], amount, row["decimals"])
             if value is None:
-                totals[key] = None
-            elif key not in totals:
-                totals[key] = value
-            elif totals[key] is not None:
-                totals[key] += value
-        for (chain, venue, token_id), usd in totals.items():
-            if usd is not None and usd >= cfg.thresholds.claim_reminder_usd:
+                slot["unpriced"].append(
+                    f"{_fmt(amount, row['decimals'])} {row['symbol']}")
+            else:
+                slot["usd"] += value
+        for (chain, venue, token_id), slot in totals.items():
+            # An unpriced leg always speaks: the two legs of one position are
+            # claimed together, so dropping the NFT over the leg nobody has
+            # quoted hides the dollars sitting in the other one.
+            if slot["unpriced"] or slot["usd"] >= cfg.thresholds.claim_reminder_usd:
                 reminders.append({"label": first["label"], "chain": chain,
-                                  "venue": venue, "token_id": token_id, "usd": usd})
+                                  "venue": venue, "token_id": token_id,
+                                  "usd": slot["usd"],
+                                  "unpriced": slot["unpriced"]})
     return sorted(reminders, key=lambda row: -row["usd"])
 
 

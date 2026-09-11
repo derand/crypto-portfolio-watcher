@@ -1207,10 +1207,12 @@ async def test_daily_claim_reminder_prices_both_lp_fee_legs(tmp_path):
 
     assert src.requests == [{("ethereum", "uniswap-v3"): [4242]}]
     assert claims == [{"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
-                       "token_id": 4242, "usd": 50.0}]
+                       "token_id": 4242, "usd": 50.0, "unpriced": []}]
 
 
 async def test_daily_claim_reminder_respects_the_threshold(tmp_path):
+    """A dollar of fees is not worth a gas fee to claim, and a line saying so
+    every morning is how a digest stops being read."""
     cfg, conn = setup_univ3(tmp_path)
     router = FakeRouter()
     src = FeeRangeSource(["true"], {("ethereum", "uniswap-v3", 4242): (10**15, 0)})
@@ -1218,6 +1220,70 @@ async def test_daily_claim_reminder_respects_the_threshold(tmp_path):
     prices = FakePrices({"ethereum:native": 2_000.0})
 
     assert await pipeline.claim_reminders(cfg, conn, {"univ3": src}, prices) == []
+
+
+async def test_an_unpriced_fee_leg_never_hides_the_priced_one(tmp_path):
+    """Both legs of one NFT are claimed together. Dropping the position over
+    the leg nobody has quoted buries whatever the other leg is worth - here
+    $1000 of ETH, silently, with no line and no log."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+
+    class TwoLegs(FeeRangeSource):
+        async def fetch(self, t):
+            positions, marker = await super().fetch(t)
+            positions.append(Position(
+                protocol="univ3", key="ethereum:4242:1", symbol="NEWCOIN",
+                amount_raw=7 * 10**18, decimals=18, asset_key="ethereum:newcoin",
+                accrues=True,
+                extra={"venue": "uniswap-v3", "token_id": "4242", "in_range": "true"}))
+            return positions, marker
+
+    src = TwoLegs(["true"], {("ethereum", "uniswap-v3", 4242): (5 * 10**17, 7 * 10**18)})
+    await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+    prices = FakePrices({"ethereum:native": 2_000.0})
+
+    claims = await pipeline.claim_reminders(cfg, conn, {"univ3": src}, prices)
+    assert claims == [{"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
+                       "token_id": 4242, "usd": 1000.0,
+                       "unpriced": ["7 NEWCOIN"]}]
+
+
+async def test_an_unpriced_leg_speaks_even_under_the_threshold(tmp_path):
+    """Silence must never be the consequence of not knowing what something is
+    worth: an unquoted token could be the only thing there worth claiming."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+
+    class Unquoted(FeeRangeSource):
+        async def fetch(self, t):
+            positions, marker = await super().fetch(t)
+            for p in positions:
+                p.asset_key = "ethereum:newcoin"
+                p.symbol = "NEWCOIN"
+            return positions, marker
+
+    src = Unquoted(["true"], {("ethereum", "uniswap-v3", 4242): (10**18, 0)})
+    await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+
+    claims = await pipeline.claim_reminders(cfg, conn, {"univ3": src},
+                                            FakePrices({}))
+    assert [(c["usd"], c["unpriced"]) for c in claims] == [(0.0, ["1 NEWCOIN"])]
+
+
+async def test_a_broken_fee_read_costs_the_block_and_not_the_digest(tmp_path):
+    """The reminder is a convenience on top of the digest. An exception out of
+    here reaches the tick's handler, which skips `digest.send` entirely - and
+    because the baseline is only written on delivery, a persistent fault means
+    the morning message is never sent at all."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FeeRangeSource(["true"], {})
+    await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+    src.fees = "not a mapping at all"
+
+    assert await pipeline.claim_reminders(cfg, conn, {"univ3": src},
+                                          FakePrices({})) == []
 
 
 def closed_trade(**kw):

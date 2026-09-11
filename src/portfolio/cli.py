@@ -162,12 +162,12 @@ async def _close(adapters, sources, prices) -> None:
             await a.aclose()
 
 
-def _build_bot(cfg, conn, prices, scan):
+def _build_bot(cfg, conn, prices, scan, sources=None):
     """The command bot, or None when this deployment does not answer commands."""
     if not (cfg.notify.telegram.enabled and cfg.notify.telegram.commands):
         return None
     from .bot import CommandBot
-    return CommandBot(cfg, conn, prices, scan=scan)
+    return CommandBot(cfg, conn, prices, scan=scan, sources=sources)
 
 
 def cmd_watch(args) -> int:
@@ -213,7 +213,7 @@ def cmd_watch(args) -> int:
             await asyncio.sleep(every)
 
     async def go():
-        bot = _build_bot(cfg, conn, prices, tick)
+        bot = _build_bot(cfg, conn, prices, tick, sources)
         try:
             # The bot is a plain second task: it never raises out of run(), so a
             # dead Telegram cannot stop the watching.
@@ -250,7 +250,7 @@ def cmd_bot(args) -> int:
 
     async def go():
         from .bot import CommandBot
-        bot = CommandBot(cfg, conn, prices, scan=tick)
+        bot = CommandBot(cfg, conn, prices, scan=tick, sources=sources)
         try:
             await bot.run()
         finally:
