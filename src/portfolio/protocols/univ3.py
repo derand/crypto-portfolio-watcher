@@ -85,9 +85,11 @@ class UniV3Source:
         self._entries = entries or []
         self._adapter = adapter or EvmAdapter(api_key)
         self._own = adapter is None
-        # Pool addresses and token metadata never change; a watcher runs for
-        # weeks, so asking again every fifteen minutes is pure waste.
+        # Pool addresses, the factory behind them and token metadata never
+        # change; a watcher runs for weeks, so asking again every fifteen
+        # minutes is pure waste.
         self._pools: dict[tuple, str] = {}
+        self._factories: dict[tuple[str, str], str] = {}
         self._meta: dict[tuple[str, str], tuple[str, int]] = {}
 
     async def aclose(self) -> None:
@@ -249,15 +251,15 @@ class UniV3Source:
         """Ask the factory once per (pair, fee) and remember the answer."""
         signature = ("getPool(address,address,int24)" if entry.kind == "slipstream"
                      else "getPool(address,address,uint24)")
-        (factory,) = await self._adapter.eth_call_many(
-            chain, [(entry.address, selector("factory()"))])
-        factory = decode_address(factory)
         wanted = []
         for p in parsed:
             key = (chain, entry.kind, p["token0"], p["token1"], p["key4"])
             p["pool_key"] = key
             if key not in self._pools and key not in wanted:
                 wanted.append(key)
+        # Asked only when there is a pool to resolve, which after the first
+        # tick is usually none at all.
+        factory = await self._factory(chain, entry) if wanted else None
         if wanted and factory:
             answers = await self._adapter.eth_call_many(chain, [
                 (factory, selector(signature)
@@ -271,6 +273,30 @@ class UniV3Source:
                     log.warning("%s: no pool for %s", entry.label, key[2:])
         for p in parsed:
             p["pool"] = self._pools.get(p["pool_key"], "")
+
+    async def _factory(self, chain: str, entry) -> str | None:
+        """Which factory this position manager was deployed against.
+
+        `immutable` on the manager, so it cannot change for the life of a
+        (chain, manager) pair, and it is needed only to resolve a pool this
+        process has not seen yet. Asked before that was known - as it was - it
+        cost a serialized round trip on every tick for an answer usually thrown
+        away: the `getPool` batch cannot be built until this one returns, so the
+        call is latency rather than the 26 compute units it looks like.
+
+        A failed read is not cached. Caching it would make one bad tick the
+        permanent answer for every position this market gains afterwards.
+        """
+        key = (chain, entry.address)
+        if key not in self._factories:
+            (answer,) = await self._adapter.eth_call_many(
+                chain, [(entry.address, selector("factory()"))])
+            found = decode_address(answer)
+            if not found:
+                log.warning("%s: position manager named no factory", entry.label)
+                return None
+            self._factories[key] = found.lower()
+        return self._factories[key]
 
     async def _slots(self, chain: str, parsed: list[dict]) -> dict[str, tuple[int, int]]:
         pools = sorted({p["pool"] for p in parsed if p["pool"]})

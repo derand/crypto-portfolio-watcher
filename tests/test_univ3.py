@@ -231,6 +231,35 @@ async def test_an_unreachable_index_costs_calls_and_not_the_positions():
         selector("tokenOfOwnerByIndex(address,uint256)"))]
 
 
+async def test_the_factory_is_asked_once_and_only_when_a_pool_is_unknown():
+    """factory() is immutable on the position manager and is needed only to
+    resolve a pool this process has not seen. Asked on every tick it was a
+    serialized round trip whose answer was thrown away - the getPool batch
+    cannot be built until it returns - for a pool address already in memory."""
+    src, calls = source(market(-14377), [UNI])
+    await src.fetch(target())
+    await src.fetch(target())
+
+    asked = [c for c in calls if c[1] == selector("factory()")]
+    assert len(asked) == 1, "the second tick knew the pool already"
+    assert len([c for c in calls if c[1].startswith(
+        selector("getPool(address,address,uint24)"))]) == 1
+
+
+async def test_a_factory_that_could_not_be_read_is_not_remembered_as_none():
+    """One reverted read must not become the permanent answer: every position
+    this market gains afterwards would be unresolvable, and a position with no
+    pool is a position with no amount."""
+    answers = market(-14377)
+    hidden = answers.pop((NFPM, selector("factory()")))
+    src, _ = source(answers, [UNI])
+    assert await src.fetch(target()) == ([], "")
+
+    answers[(NFPM, selector("factory()"))] = hidden
+    positions, _ = await src.fetch(target())
+    assert len(positions) == 2
+
+
 async def test_uncollected_fees_are_read_only_by_the_daily_claim_path():
     """tokensOwed in the NFT only updates when the position is poked, so on one
     left alone it reads zero while real fees sit there. Simulating collect() is
