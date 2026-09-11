@@ -1101,6 +1101,17 @@ class FakeRangeSource:
         return [p], f"{state}:{self.i}"
 
 
+class FeeRangeSource(FakeRangeSource):
+    def __init__(self, states, fees):
+        super().__init__(states)
+        self.fees = fees
+        self.requests = []
+
+    async def claimable_fees(self, t, wanted):
+        self.requests.append(wanted)
+        return self.fees
+
+
 UNIV3_CFG = EVM_CFG.replace("watch: [native]", "watch: [native, univ3]")
 
 
@@ -1173,6 +1184,40 @@ async def test_the_drifting_amount_of_a_range_position_stays_silent(tmp_path):
     kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events")]
     assert kinds and set(kinds) == {"accrual"}
     assert router.sent == []
+
+
+async def test_daily_claim_reminder_prices_both_lp_fee_legs(tmp_path):
+    """Fees are fetched from the stored NFT once per digest, never per tick."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+
+    class TwoLegs(FeeRangeSource):
+        async def fetch(self, t):
+            positions, marker = await super().fetch(t)
+            positions.append(Position(
+                protocol="univ3", key="ethereum:4242:1", symbol="USDC",
+                amount_raw=10**6, decimals=6, asset_key="ethereum:usdc", accrues=True,
+                extra={"venue": "uniswap-v3", "token_id": "4242", "in_range": "true"}))
+            return positions, marker
+
+    src = TwoLegs(["true"], {("ethereum", "uniswap-v3", 4242): (10**16, 30 * 10**6)})
+    await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+    prices = FakePrices({"ethereum:native": 2_000.0, "ethereum:usdc": 1.0})
+    claims = await pipeline.claim_reminders(cfg, conn, {"univ3": src}, prices)
+
+    assert src.requests == [{("ethereum", "uniswap-v3"): [4242]}]
+    assert claims == [{"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
+                       "token_id": 4242, "usd": 50.0}]
+
+
+async def test_daily_claim_reminder_respects_the_threshold(tmp_path):
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FeeRangeSource(["true"], {("ethereum", "uniswap-v3", 4242): (10**15, 0)})
+    await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+    prices = FakePrices({"ethereum:native": 2_000.0})
+
+    assert await pipeline.claim_reminders(cfg, conn, {"univ3": src}, prices) == []
 
 
 def closed_trade(**kw):

@@ -26,7 +26,7 @@ def _rows(conn, sql, args=()):
     return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
-def collect(conn, prices=None) -> dict:
+def collect(conn, prices=None, claim_reminders: list[dict] | None = None) -> dict:
     balances = _rows(conn, """
         SELECT a.label, s.asset_key, s.symbol, s.decimals, s.chain,
                b.amount_raw, b.updated_at
@@ -108,7 +108,8 @@ def collect(conn, prices=None) -> dict:
             as_of = max(stamps)[:16].replace("T", " ")
 
     return {"balances": balances, "positions": positions, "recent": recent,
-            "total": total, "unpriced": unpriced, "as_of": as_of}
+            "total": total, "unpriced": unpriced, "as_of": as_of,
+            "claim_reminders": claim_reminders or []}
 
 
 def _scale(row) -> int:
@@ -720,11 +721,17 @@ def render(conn, data: dict, cfg=None) -> Message:
                         mono=False))
     if detail:
         blocks.append(Block(lines=detail, collapsed=True))
+    claims = data.get("claim_reminders", [])
+    if claims:
+        lines = [f"{row['label']} {row['venue']} #{row['token_id']}  "
+                 f"${row['usd']:,.2f}" for row in claims]
+        blocks.append(Block(title="LP fees ready to claim", lines=lines))
     return Message(title="Daily digest", body=flatten(blocks), blocks=blocks,
                    severity=Severity.LOW, kind=EventKind.SERVICE)
 
 
-async def send(cfg, conn, router, prices=None) -> tuple[Message, dict]:
+async def send(cfg, conn, router, prices=None,
+               claim_reminders: list[dict] | None = None) -> tuple[Message, dict]:
     """Send the daily digest and record what tomorrow measures against.
 
     Returns the message and the per-channel results. The baseline is written
@@ -734,7 +741,7 @@ async def send(cfg, conn, router, prices=None) -> tuple[Message, dict]:
     tomorrow's "change since yesterday" is measured from. Leaving LAST_DATE
     unset also makes due() stay true, so the next tick simply tries again.
     """
-    data = collect(conn, prices)
+    data = collect(conn, prices, claim_reminders)
     message = render(conn, data, cfg)
     results = await router.send(message)
     failed = {ch: err for ch, err in results.items() if err}

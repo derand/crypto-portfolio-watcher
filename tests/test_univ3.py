@@ -186,7 +186,7 @@ async def test_one_nft_becomes_two_legs_that_can_be_priced():
         "composition moves with every trade; alerting on it never stops"
 
 
-async def test_uncollected_fees_come_from_simulating_the_payout():
+async def test_uncollected_fees_are_read_only_by_the_daily_claim_path():
     """tokensOwed in the NFT only updates when the position is poked, so on one
     left alone it reads zero while real fees sit there. Simulating collect() is
     the reading that is actually true - and it is only given to the owner, so
@@ -194,8 +194,13 @@ async def test_uncollected_fees_come_from_simulating_the_payout():
     src, calls = source(market(-14377, fees=(84250230863135893, 661007116889360)),
                         [UNI])
     positions, _ = await src.fetch(target())
-    assert positions[0].extra["fees_raw"] == "84250230863135893"
-    assert positions[1].extra["fees_raw"] == "661007116889360"
+    assert "fees_raw" not in positions[0].extra
+    assert not [c for c in calls if c[1].startswith(
+        selector("collect((uint256,address,uint128,uint128))"))]
+    fees = await src.claimable_fees(
+        target(), {("ethereum", "uniswap-v3"): [TOKEN_ID]})
+    assert fees[("ethereum", "uniswap-v3", TOKEN_ID)] == \
+        (84250230863135893, 661007116889360)
     collects = [c for c in calls if c[1].startswith(
         selector("collect((uint256,address,uint128,uint128))"))]
     assert collects and all(c[2] == ME for c in collects), \

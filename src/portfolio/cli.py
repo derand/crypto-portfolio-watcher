@@ -198,7 +198,9 @@ def cmd_watch(args) -> int:
                 log.info("tick: probed %d, changed %d, new %d, confirmed %d",
                          res.probed, res.changed, res.new_events, res.confirmed)
                 if digest.due(cfg, conn):
-                    _, results = await digest.send(cfg, conn, router, prices)
+                    from . import pipeline
+                    claims = await pipeline.claim_reminders(cfg, conn, sources, prices)
+                    _, results = await digest.send(cfg, conn, router, prices, claims)
                     if any(results.values()):
                         # Not recorded, so due() stays true and the next tick
                         # tries again rather than losing the day silently.
@@ -263,19 +265,26 @@ def cmd_bot(args) -> int:
 
 
 def cmd_digest(args) -> int:
+    from .protocols import build_sources
+
     cfg, conn = _open(args)
     prices = build_prices(cfg, conn)
+    sources = build_sources(cfg)
     router = Router(build_notifiers(cfg))
 
     async def go():
         try:
             from . import pipeline
             await prices.refresh(pipeline.priceable_assets(conn))
+            claims = await pipeline.claim_reminders(cfg, conn, sources, prices)
             if args.dry_run:
-                data = digest.collect(conn, prices)
+                data = digest.collect(conn, prices, claims)
                 return digest.render(conn, data, cfg), {}
-            return await digest.send(cfg, conn, router, prices)
+            return await digest.send(cfg, conn, router, prices, claims)
         finally:
+            for source in sources.values():
+                if hasattr(source, "aclose"):
+                    await source.aclose()
             await prices.aclose()
 
     message, results = asyncio.run(go())

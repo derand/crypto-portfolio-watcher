@@ -163,6 +163,17 @@ def test_due_fires_once_a_day(setup):
     assert digest.due(cfg, conn, datetime(2026, 1, 2, 9, 0)) is True
 
 
+def test_digest_shows_claim_worthy_lp_fees(setup):
+    cfg, conn, _, _ = setup
+    claim = {"label": "main", "chain": "ethereum", "venue": "uniswap-v3",
+             "token_id": 42, "usd": 63.5}
+    data = digest.collect(conn, Prices({"bitcoin:native": 77000.0}), [claim])
+
+    body = digest.render(conn, data, cfg).body
+    assert "LP fees ready to claim" in body
+    assert "main uniswap-v3 #42  $63.50" in body
+
+
 def test_disabled_digest_never_fires(setup):
     cfg, conn, _, _ = setup
     cfg.digest.enabled = False

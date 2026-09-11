@@ -291,6 +291,82 @@ async def scan_once(cfg, conn, router, adapters, sources=None, prices=None) -> S
     return res
 
 
+async def claim_reminders(cfg, conn, sources, prices=None) -> list[dict]:
+    """Price daily Uni v3 fee reads and retain only claim-worthy positions.
+
+    The regular position scan has already established which NFTs are open and
+    which two assets each holds. Reusing that state makes the daily path one
+    simulated `collect()` per NFT instead of repeating NFT enumeration, pool
+    discovery and price reads.
+    """
+    source = (sources or {}).get("univ3")
+    read_fees = getattr(source, "claimable_fees", None)
+    if read_fees is None:
+        return []
+
+    rows = conn.execute("""
+        SELECT a.id AS address_id, a.address, a.label, p.position_key, p.extra,
+               s.asset_key, s.decimals
+          FROM positions p
+          JOIN addresses a ON a.id=p.address_id
+          JOIN assets s ON s.id=p.asset_id
+         WHERE a.enabled=1 AND p.protocol='univ3'
+         ORDER BY a.id, p.position_key""").fetchall()
+    by_address: dict[int, list] = {}
+    for row in rows:
+        by_address.setdefault(row["address_id"], []).append(row)
+
+    reminders = []
+    for held in by_address.values():
+        first = held[0]
+        requested: dict[tuple[str, str], list[int]] = {}
+        parsed = []
+        for row in held:
+            try:
+                chain, token_id, leg = row["position_key"].split(":")
+                extra = json.loads(row["extra"] or "{}")
+                venue = extra["venue"]
+                key = (chain, venue, int(token_id), int(leg))
+            except (KeyError, TypeError, ValueError):
+                continue
+            requested.setdefault((chain, venue), []).append(key[2])
+            parsed.append((key, row))
+        if not requested:
+            continue
+        requested = {key: sorted(set(ids)) for key, ids in requested.items()}
+        target = Target(address=first["address"], label=first["label"],
+                        watch=frozenset(("univ3",)), chains=())
+        try:
+            fees = await read_fees(target, requested)
+        except Exception:  # noqa: BLE001 - a digest must survive a fee-read failure
+            log.exception("%s/univ3: daily LP fee read failed", first["label"])
+            continue
+
+        totals: dict[tuple[str, str, int], float | None] = {}
+        for (chain, venue, token_id, leg), row in parsed:
+            raw = fees.get((chain, venue, token_id))
+            if raw is None:
+                continue
+            amount = raw[leg]
+            key = (chain, venue, token_id)
+            if not amount:
+                totals.setdefault(key, 0.0)
+                continue
+            value = (_usd_of(prices, row["asset_key"], amount, row["decimals"])
+                     if prices else None)
+            if value is None:
+                totals[key] = None
+            elif key not in totals:
+                totals[key] = value
+            elif totals[key] is not None:
+                totals[key] += value
+        for (chain, venue, token_id), usd in totals.items():
+            if usd is not None and usd >= cfg.thresholds.claim_reminder_usd:
+                reminders.append({"label": first["label"], "chain": chain,
+                                  "venue": venue, "token_id": token_id, "usd": usd})
+    return sorted(reminders, key=lambda row: -row["usd"])
+
+
 async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
                       channels, own, prices=None) -> None:
     """One address in one network. Everything below is per-scope state."""

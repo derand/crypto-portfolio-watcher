@@ -15,8 +15,8 @@ Three things about this shape drive the design here:
   * **Uncollected fees are not in the NFT.** `tokensOwed0/1` only move when the
     position is poked, so on a position untouched for years they read zero while
     real fees sit there. The honest reading is to simulate `collect()` with
-    `eth_call` and take what it says it would pay - which is why this source
-    needs a `from` address on its calls.
+    `eth_call`. That is digest work, not tick work, so `claimable_fees()` does
+    it once a day from the positions already stored by the normal reader.
   * **The alert worth having is "out of range".** Everything else about a
     position moves continuously; leaving the range is discrete, actionable, and
     means the liquidity has stopped earning and turned into one asset.
@@ -104,6 +104,33 @@ class UniV3Source:
         positions.sort(key=lambda p: p.key)
         return positions, "|".join(sorted(marks))
 
+    async def claimable_fees(self, t: Target,
+                             wanted: dict[tuple[str, str], list[int]]) \
+            -> dict[tuple[str, str, int], tuple[int, int]]:
+        """What `collect()` would pay for the stored open position NFTs.
+
+        `wanted` is keyed by (chain, catalog protocol label), so this avoids
+        re-enumerating NFTs or re-reading position and pool state just to build
+        the daily claim reminder. A missing/reverted answer is omitted rather
+        than misreported as zero.
+        """
+        out: dict[tuple[str, str, int], tuple[int, int]] = {}
+        for (chain, venue), ids in wanted.items():
+            entry = next((e for e in self._on(chain) if e.protocol == venue), None)
+            if entry is None:
+                log.warning("%s/%s: no position manager for stored LP fees", t.label, venue)
+                continue
+            answers = await self._adapter.eth_call_many(chain, [
+                (entry.address, selector("collect((uint256,address,uint128,uint128))")
+                 + f"{token_id:064x}{int(t.address, 16):064x}"
+                 f"{MAX_UINT128:064x}{MAX_UINT128:064x}") for token_id in ids],
+                sender=t.address)
+            for token_id, answer in zip(ids, answers):
+                fee0, fee1 = _word(answer, 0), _word(answer, 1)
+                if fee0 is not None and fee1 is not None:
+                    out[(chain, venue, token_id)] = (fee0, fee1)
+        return out
+
     async def _market(self, t: Target, chain: str, entry):
         nfpm = entry.address
         call = self._adapter.eth_call_many
@@ -120,13 +147,6 @@ class UniV3Source:
 
         raw = await call(chain, [(nfpm, selector("positions(uint256)") + f"{i:064x}")
                                  for i in ids])
-        # Fees are what collect() would pay out, not what tokensOwed remembers.
-        fees = await call(chain, [
-            (nfpm, selector("collect((uint256,address,uint128,uint128))")
-             + f"{i:064x}{int(t.address, 16):064x}"
-             f"{MAX_UINT128:064x}{MAX_UINT128:064x}") for i in ids],
-            sender=t.address)
-
         parsed = []
         for token_id, answer in zip(ids, raw):
             liquidity = _word(answer, 7)
@@ -149,7 +169,6 @@ class UniV3Source:
         await self._resolve_meta(chain, parsed)
 
         out, marks = [], []
-        by_id = dict(zip(ids, fees))
         for p in parsed:
             slot = slots.get(p["pool"])
             if slot is None:
@@ -160,11 +179,8 @@ class UniV3Source:
             amount0, amount1 = tickmath.amounts_for_liquidity(
                 sqrt_price, p["lower"], p["upper"], p["liquidity"])
             inside = tickmath.in_range(tick, p["lower"], p["upper"])
-            fee0 = _word(by_id[p["id"]], 0) or 0
-            fee1 = _word(by_id[p["id"]], 1) or 0
-
-            for leg, (contract, amount, fee) in enumerate(
-                    ((p["token0"], amount0, fee0), (p["token1"], amount1, fee1))):
+            for leg, (contract, amount) in enumerate(
+                    ((p["token0"], amount0), (p["token1"], amount1))):
                 symbol, decimals = self._meta.get((chain, contract), ("", 18))
                 out.append(Position(
                     protocol=self.name,
@@ -181,8 +197,7 @@ class UniV3Source:
                            "pool": p["pool"], "tick": str(tick),
                            "tick_lower": str(p["lower"]),
                            "tick_upper": str(p["upper"]),
-                           "in_range": "true" if inside else "false",
-                           "fees_raw": str(fee)}))
+                           "in_range": "true" if inside else "false"}))
             marks.append(f"{chain}:{p['id']}={p['liquidity']}:{p['lower']}:"
                          f"{p['upper']}:{int(inside)}:{tick // MARKER_TICK_BUCKET}")
         return out, marks
