@@ -104,8 +104,14 @@ worth keeping: the composition drifts with every trade, so both legs are `accrue
 probe marker carries the tick **bucketed to 60** rather than the amounts; uncollected fees
 are not in the NFT at all (`tokensOwed` only moves when the position is poked, so it reads
 zero on an untouched position) and are read by simulating `collect()` — which only answers
-the owner, hence `eth_call_many(sender=…)`; and the one alert worth having is **leaving the
-range**, a discrete event meaning the liquidity stopped earning. Forks share the interface
+the owner, hence `eth_call_many(sender=…)`, and which happens once a day for the digest rather
+than every tick, because a claimable balance is reminder material and never an alert; and the
+one alert worth having is **leaving the range**, a discrete event meaning the liquidity stopped
+earning. Which NFTs are held comes from `EvmAdapter.owned_nfts` — one request instead of one
+`eth_call` per position — but `balanceOf` still supplies the count, because that index is a
+second source of truth and a list short by one reads exactly like a closed position; a
+disagreement, or an index that cannot be reached, falls back to the enumerable contract.
+Forks share the interface
 except in one place: Aerodrome Slipstream puts a tick spacing where Uniswap puts a fee tier
 and its factory takes `int24`, so it is a separate catalog kind rather than a guess.
 

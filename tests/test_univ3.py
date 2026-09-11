@@ -111,10 +111,18 @@ def position_answer(token0, token1, key4, lower, upper, liquidity):
                liquidity, 0, 0, 0, 0)
 
 
-def source(answers, entries, seen=None):
+def source(answers, entries, seen=None, owned=None, index_status=200):
+    """`owned`: what the NFT index lists, defaulting to the one position."""
     calls = seen if seen is not None else []
 
     def handler(request):
+        if request.method == "GET":
+            calls.append(("nft-index", str(request.url), None))
+            if index_status != 200:
+                return httpx.Response(index_status, json={})
+            ids = [TOKEN_ID] if owned is None else owned
+            return httpx.Response(200, json={
+                "ownedNfts": [{"tokenId": str(i)} for i in ids]})
         out = []
         for call in json.loads(request.content):
             params = call["params"][0]
@@ -129,7 +137,8 @@ def source(answers, entries, seen=None):
         return httpx.Response(200, json=out)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    adapter = EvmAdapter("key", {}, client=client, url_template="http://{net}/{key}")
+    adapter = EvmAdapter("key", {}, client=client, url_template="http://{net}/{key}",
+                         nft_url_template="http://nft/{net}/{key}")
     return UniV3Source(entries=entries, adapter=adapter), calls
 
 
@@ -184,6 +193,42 @@ async def test_one_nft_becomes_two_legs_that_can_be_priced():
     assert all(p.amount_raw > 0 for p in positions), "in range: both legs held"
     assert all(p.accrues for p in positions), \
         "composition moves with every trade; alerting on it never stops"
+
+
+async def test_the_held_ids_come_from_the_index_not_one_call_per_position():
+    """tokenOfOwnerByIndex is one eth_call per position - 35 of them on the
+    measured portfolio, for a list the NFT index hands over in one request.
+    At 26 compute units each that is most of what a tick spends here."""
+    src, calls = source(market(-14377), [UNI])
+    positions, _ = await src.fetch(target())
+    assert len(positions) == 2
+    assert any(c[0] == "nft-index" for c in calls)
+    assert not [c for c in calls if c[1].startswith(
+        selector("tokenOfOwnerByIndex(address,uint256)"))]
+
+
+async def test_an_index_short_of_the_balance_is_not_a_closed_position():
+    """The index is a second source of truth and may lag. Read at face value a
+    short list reports the missing NFTs as closed - which alerts, deletes the
+    stored row and writes a terminal zero into the history no later tick can
+    take back. balanceOf is the count; a disagreement asks the contract."""
+    src, calls = source(market(-14377), [UNI], owned=[])
+    positions, _ = await src.fetch(target())
+    assert [p.key for p in positions] == [f"ethereum:{TOKEN_ID}:0",
+                                          f"ethereum:{TOKEN_ID}:1"]
+    assert [c for c in calls if c[1].startswith(
+        selector("tokenOfOwnerByIndex(address,uint256)"))], "the contract decides"
+
+
+async def test_an_unreachable_index_costs_calls_and_not_the_positions():
+    """The index is an optimisation, and v3 has the enumerable contract the
+    optimisation replaces. A 403 from the NFT API - a key without that product
+    is one - must cost the tick 35 calls, never the position."""
+    src, calls = source(market(-14377), [UNI], index_status=403)
+    positions, _ = await src.fetch(target())
+    assert len(positions) == 2
+    assert [c for c in calls if c[1].startswith(
+        selector("tokenOfOwnerByIndex(address,uint256)"))]
 
 
 async def test_uncollected_fees_are_read_only_by_the_daily_claim_path():

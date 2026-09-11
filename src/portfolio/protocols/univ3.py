@@ -21,6 +21,11 @@ Three things about this shape drive the design here:
     position moves continuously; leaving the range is discrete, actionable, and
     means the liquidity has stopped earning and turned into one asset.
 
+Which NFTs an owner holds is asked of the NFT index, not of the contract, one
+request instead of one call per position - but `balanceOf` still gives the count,
+because the index is a second source of truth and a list short by one reads
+exactly like a closed position. See `_ids`.
+
 Forks differ in one place that matters. Uniswap, PancakeSwap and SushiSwap put a
 fee tier in the fourth field of positions() and take uint24 in getPool; Aerodrome
 Slipstream puts a tick spacing there and takes int24. Calling the wrong one
@@ -131,6 +136,45 @@ class UniV3Source:
                     out[(chain, venue, token_id)] = (fee0, fee1)
         return out
 
+    async def _ids(self, t: Target, chain: str, entry, held: int) -> list[int]:
+        """Which position NFTs this owner holds, listed in one request.
+
+        `tokenOfOwnerByIndex` is one `eth_call` per position - 35 of them on
+        the measured portfolio, against a single request to the NFT index for
+        the whole list. That index is a different source of truth, though, and
+        it may lag, so `balanceOf` stays the authority on *how many* there are:
+        a short list taken at face value reports every id it left out as a
+        closed position, which alerts, deletes the stored row and writes a
+        terminal zero into the history that no later tick can take back.
+
+        So a disagreement, or an index that cannot be reached at all, falls
+        back to asking the contract - the calls are paid only in the tick where
+        that happens, and the index stays an optimisation rather than a
+        dependency. v4 has no such fallback to offer; see `univ4`.
+
+        What the count cannot catch is a list wrong in both directions at once,
+        naming an id since transferred away while omitting one still held:
+        `positions()` takes a token id and says nothing about who owns it, so
+        the only check is `ownerOf` per id - one call per position, which is
+        exactly the cost this replaces. The index answers current ownership
+        rather than transfer history, which is what makes that acceptable.
+        """
+        try:
+            ids = sorted(set(await self._adapter.owned_nfts(chain, t.address,
+                                                            entry.address)))
+        except Exception as e:  # noqa: BLE001 - any failure here has a fallback
+            log.warning("%s/%s: NFT index unavailable (%s); asking the contract",
+                        t.label, entry.protocol, e)
+            ids = []
+        if len(ids) == held:
+            return ids
+        log.warning("%s/%s: NFT index listed %d of %d positions; asking the contract",
+                    t.label, entry.protocol, len(ids), held)
+        answers = await self._adapter.eth_call_many(chain, [
+            (entry.address, selector("tokenOfOwnerByIndex(address,uint256)")
+             + f"{int(t.address, 16):064x}{i:064x}") for i in range(held)])
+        return [i for i in (decode_uint(a) for a in answers) if i is not None]
+
     async def _market(self, t: Target, chain: str, entry):
         nfpm = entry.address
         call = self._adapter.eth_call_many
@@ -140,10 +184,9 @@ class UniV3Source:
         if not held:
             return [], []
 
-        ids = [decode_uint(a) for a in await call(chain, [
-            (nfpm, selector("tokenOfOwnerByIndex(address,uint256)")
-             + f"{int(t.address, 16):064x}{i:064x}") for i in range(held)])]
-        ids = [i for i in ids if i is not None]
+        ids = await self._ids(t, chain, entry, held)
+        if not ids:
+            return [], []
 
         raw = await call(chain, [(nfpm, selector("positions(uint256)") + f"{i:064x}")
                                  for i in ids])
