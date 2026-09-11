@@ -115,6 +115,17 @@ Forks share the interface
 except in one place: Aerodrome Slipstream puts a tick spacing where Uniswap puts a fee tier
 and its factory takes `int24`, so it is a separate catalog kind rather than a guess.
 
+**Many reads are one read.** `eth_call_many` puts up to fifty calls into a single `eth_call`
+through Multicall3 (`MULTICALL3` in `chains/evm.py` — a deterministic deployment, so one address
+on every network, verified on chain and re-checked by `catalog-check`). It is `aggregate3`
+because only that variant allows failure per call, which is what lets the interface keep
+answering positionally with `None` for a revert. Two rules: a call carrying a `sender` is
+**never** aggregated, because through the aggregator the sender is the aggregator and the
+simulated `collect()` only answers the owner; and an answer that is not the shape `aggregate3`
+returns is not data — the calls are asked again the plain way, because a list of `None` reads as
+every position having closed. At 26 compute units per `eth_call` regardless of payload, this is
+what took a range-position tick from 55 calls across six paced round trips to two.
+
 **Uniswap v4 keeps that arithmetic and replaces everything around it**
 (`protocols/univ4.py`, watch keyword `univ4`). Every pool lives inside one `PoolManager`, so
 there is no pool contract and no `slot0()` — the price is read with `extsload` at a slot

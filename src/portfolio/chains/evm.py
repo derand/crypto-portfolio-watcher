@@ -21,16 +21,19 @@ from eth_utils import keccak
 
 from ..models import BalanceSnapshot, Direction, Probe, Transfer
 from ..retry import Permanent, Unavailable, redact, with_retry
+from . import abi
 from .base import AddressState, Cursor, Target
 
 log = logging.getLogger(__name__)
 
-# network -> (alchemy subdomain, native symbol, supports the "internal" category)
+# network -> (alchemy subdomain, native symbol, supports the "internal"
+# category, chain id). The chain id is here rather than in a second dict beside
+# it, because two maps keyed by network are two maps that drift apart.
 NETWORKS = {
-    "ethereum": ("eth-mainnet", "ETH", True),
-    "arbitrum": ("arb-mainnet", "ETH", False),   # no internal transfers on Alchemy
-    "base":     ("base-mainnet", "ETH", True),
-    "bsc":      ("bnb-mainnet", "BNB", False),   # no internal transfers either
+    "ethereum": ("eth-mainnet", "ETH", True, 1),
+    "arbitrum": ("arb-mainnet", "ETH", False, 42161),  # no internal transfers
+    "base":     ("base-mainnet", "ETH", True, 8453),
+    "bsc":      ("bnb-mainnet", "BNB", False, 56),     # no internal transfers either
 }
 NATIVE_DECIMALS = 18
 MAX_PAGES = 5
@@ -39,6 +42,23 @@ METADATA_BATCH = 20                        # metadata calls per JSON-RPC batch
 BALANCES_BATCH = 100                       # contracts per alchemy_getTokenBalances
 NFT_PAGE_SIZE = 100                        # token ids per NFT-index request
 NFT_PAGES = 10                             # a thousand positions is already absurd
+MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"
+"""The canonical Multicall3 deployment, the same address on every network here.
+
+Deterministic deployment is the whole point of it: one address, chain after
+chain, so this is a fact about the networks like the subdomains above and not a
+protocol entry point - it enumerates nothing and says nothing about what anyone
+holds, which is why it is not in `catalog/`.
+
+Verified on chain on 2026-09-11 on all four networks: it answers `getChainId()`
+with the id each network actually is, and an `aggregate3` of three calls
+returned exactly what the same three plain `eth_call`s returned, including None
+for the one that reverts. `pw catalog-check` repeats the chain id half.
+"""
+AGGREGATE_BATCH = 50
+"""Calls per `aggregate3`. One `eth_call` is 26 compute units whatever it
+carries, so the limit here is not the quota but the node: every subcall shares
+the outer call's gas, and a payload nobody will serve is worse than two."""
 CALL_BATCH = 10
 """eth_calls per JSON-RPC batch, sized by the compute limit rather than by HTTP.
 
@@ -191,8 +211,13 @@ class EvmAdapter:
         `sender` fills in `from`. Nothing needs it to read a balance, but a few
         useful answers are only given to the owner: Uniswap's position manager
         reports uncollected fees by simulating `collect()`, and simulates it as
-        whoever is asking.
+        whoever is asking - which is also why those calls are never aggregated:
+        through Multicall3 the sender would be Multicall3.
         """
+        if sender is None and len(calls) > 1:
+            aggregated = await self._aggregated(scope, calls)
+            if aggregated is not None:
+                return aggregated
         out: list = []
         for i in range(0, len(calls), chunk):
             if i:
@@ -214,6 +239,39 @@ class EvmAdapter:
             # whole sweep.
             out.extend(await self._rpc(scope, batch, allow_errors=True,
                                        attempts=5, base=2.0))
+        return out
+
+    async def _aggregated(self, scope: str, calls: list[tuple[str, str]]) -> list | None:
+        """The same answers, asked as one `eth_call` through Multicall3.
+
+        This is the difference between 55 calls and two for one range-position
+        market: a batch of JSON-RPC requests still costs 26 compute units per
+        call and has to be paced under the per-second limit (CALL_PACE), while
+        an aggregate is one call however many questions it carries, so the
+        pacing stops applying to it as well.
+
+        None means "not answered in the shape aggregate3 returns" - a network
+        where it is not deployed, a node refusing the payload, an outer call
+        that ran out of gas - and the caller then asks the calls the plain way.
+        That fallback is the safety property, not a nicety: returning a list of
+        Nones instead would read as every position having closed, which alerts,
+        deletes stored rows and writes terminal zeros into the history.
+        """
+        out: list = []
+        for i in range(0, len(calls), AGGREGATE_BATCH):
+            part = calls[i:i + AGGREGATE_BATCH]
+            # As patient with the provider as the plain path it replaces: one
+            # request instead of six is less likely to meet the rate limit,
+            # never a reason to give up on it sooner.
+            answers = await self._rpc(scope, [("eth_call", [
+                {"to": MULTICALL3, "data": abi.encode_aggregate3(part)},
+                "latest"])], allow_errors=True, attempts=5, base=2.0)
+            got = abi.decode_aggregate3(answers[0] if answers else None, len(part))
+            if got is None:
+                log.warning("%s: aggregate3 did not answer %d calls; asking them "
+                            "the plain way", scope, len(part))
+                return None
+            out.extend(got)
         return out
 
     def _whitelist(self, scope: str) -> list:

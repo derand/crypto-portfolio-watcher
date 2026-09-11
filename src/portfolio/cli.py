@@ -397,7 +397,7 @@ def cmd_catalog_check(args) -> int:
     cfg = cfgmod.load(args.config, args.env)
     if not cfg.api_keys.alchemy:
         raise Permanent("ALCHEMY_API_KEY is not set; the catalog is checked on chain")
-    from .chains.evm import NETWORKS
+    from .chains.evm import MULTICALL3, NETWORKS
 
     entries = catalog.load()
     adapter = EvmAdapter(cfg.api_keys.alchemy)
@@ -414,11 +414,11 @@ def cmd_catalog_check(args) -> int:
                 listed[chain] = await discover._receipts(adapter, chain, on_chain)
                 managers[chain] = await discover.position_managers(
                     adapter, chain, on_chain)
-            return listed, managers
+            return listed, managers, await discover.aggregators(adapter)
         finally:
             await adapter.aclose()
 
-    found, managers = asyncio.run(go())
+    found, managers, aggregators = asyncio.run(go())
     bad = 0
     print(f"{len(entries)} entries, "
           f"{len({e.protocol for e in entries})} protocols, "
@@ -445,6 +445,17 @@ def cmd_catalog_check(args) -> int:
         else:
             bad += 1
             print(f"  STALE {entry.label:26} listed nothing - check {entry.address}")
+    # Multicall3 is not a catalog entry - it enumerates nothing and names no
+    # protocol - but it is an address in the code that every tick trusts, and
+    # this is the command where addresses are held to account.
+    print()
+    for chain, (reported, expected) in aggregators.items():
+        if reported == expected:
+            print(f"  ok    {'multicall3/' + chain:26} chain id {reported}")
+        else:
+            bad += 1
+            print(f"  STALE {'multicall3/' + chain:26} answered {reported}, "
+                  f"not {expected} - check {MULTICALL3}")
     if bad:
         print(f"\n{bad} entr{'y' if bad == 1 else 'ies'} answered nothing. An entry "
               f"that lists no tokens hides every position behind it.")

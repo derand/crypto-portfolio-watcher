@@ -26,6 +26,79 @@ def encode_address(signature: str, address: str) -> str:
     return selector(signature) + f"{int(address, 16):064x}"
 
 
+AGGREGATE3 = "aggregate3((address,bool,bytes)[])"
+"""Multicall3's batching entry point, and the only method of it used here.
+
+`aggregate` reverts the whole batch if any call fails and `tryAggregate` takes
+one flag for all of them; `aggregate3` carries the flag per call, which is the
+only variant that can keep `eth_call_many`'s promise - answers line up with the
+calls, and a reverted one is None rather than the end of the batch.
+"""
+
+
+def encode_aggregate3(calls: list[tuple[str, str]]) -> str:
+    """Calldata asking Multicall3 for a list of (to, calldata), all at once.
+
+    `allowFailure` is set on every call, so one contract without the method
+    asked of it costs its own answer and nothing else.
+
+    The struct carries `bytes`, which makes it dynamic, so the array is encoded
+    as a count followed by one offset per element rather than as a flat run of
+    words. Those offsets are relative to the start of the array's data - the
+    word after the count - and not to the start of the payload, which is the
+    mistake this function exists to make exactly once.
+    """
+    structs = []
+    for to, data in calls:
+        payload = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+        structs.append(f"{int(to, 16):064x}"
+                       + f"{1:064x}"              # allowFailure
+                       + f"{WORD * 3:064x}"       # where the bytes start
+                       + f"{len(payload):064x}"
+                       + payload.hex()
+                       + "00" * (-len(payload) % WORD))
+    heads, at = [], WORD * len(structs)
+    for struct in structs:
+        heads.append(f"{at:064x}")
+        at += len(struct) // 2
+    return (selector(AGGREGATE3) + f"{WORD:064x}" + f"{len(structs):064x}"
+            + "".join(heads) + "".join(structs))
+
+
+def decode_aggregate3(data, count: int) -> list[str | None] | None:
+    """The per-call answers, in the order they were asked.
+
+    A call Multicall3 reports as failed comes back None, which is what a revert
+    already means to every caller. `None` in place of the whole list means the
+    answer was not the shape `aggregate3` returns at all - the wrong contract,
+    or a network where it was never deployed - and is deliberately told apart
+    from a list of Nones: the caller can retry the calls one batch at a time,
+    where reading "every position answered nothing" as data would report a
+    portfolio as closed.
+    """
+    b = _body(data)
+    if b is None:
+        return None
+    try:
+        head = _word(b, 0)
+        if _counted(b, head) != count:
+            return None
+        base = head + WORD
+        out: list[str | None] = []
+        for i in range(count):
+            item = base + _word(b, base + i * WORD)
+            ok = _word(b, item)
+            at = item + _word(b, item + WORD)
+            length = _word(b, at)
+            raw = b[at + WORD:at + WORD + length]
+            if len(raw) != length:
+                return None
+            out.append("0x" + raw.hex() if ok else None)
+        return out
+    except (IndexError, ValueError):
+        return None
+
+
 def _body(data) -> bytes | None:
     if not isinstance(data, str) or not data.startswith("0x") or len(data) < 3:
         return None

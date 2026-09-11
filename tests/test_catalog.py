@@ -4,11 +4,12 @@ import threading
 import httpx
 import pytest
 
+import multicall
 from portfolio import catalog
 from portfolio import config as cfgmod
 from portfolio import discover
 from portfolio.chains import abi
-from portfolio.chains.evm import EvmAdapter
+from portfolio.chains.evm import MULTICALL3, EvmAdapter
 
 ME = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
 ALSO_ME = "0x2222222222222222222222222222222222222222"
@@ -134,6 +135,14 @@ def adapter(answers, balances=None, seen=None):
                 continue
             params = call["params"][0]
             to, data = params["to"].lower(), params["data"]
+            if to == MULTICALL3:
+                # Recorded the way this handler records a plain call: by
+                # selector, so the assertions below keep their meaning.
+                for sub_to, sub_data in multicall.subcalls(data):
+                    calls.append((sub_to, sub_data[:10]))
+                out.append({"jsonrpc": "2.0", "id": call["id"],
+                            "result": multicall.answer(answers, data)})
+                continue
             calls.append((to, data[:10]))
             got = answers.get((to, data))
             if got is None:

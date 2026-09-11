@@ -3,10 +3,11 @@ import json
 import httpx
 from eth_utils import keccak
 
+import multicall
 from portfolio import catalog
 from portfolio.chains.abi import selector
 from portfolio.chains.base import Target
-from portfolio.chains.evm import EvmAdapter
+from portfolio.chains.evm import MULTICALL3, EvmAdapter
 from portfolio.protocols import ticks
 from portfolio.protocols.univ4 import (POOLS_SLOT, UniV4Source, pool_id,
                                        state_slot, unpack_info, unpack_slot0)
@@ -114,6 +115,12 @@ def source(answers, owned, entries, seen=None):
         for call in json.loads(request.content):
             params = call["params"][0]
             to, data = params["to"].lower(), params["data"]
+            if to == MULTICALL3:
+                out.append({"jsonrpc": "2.0", "id": call["id"],
+                            "result": multicall.answer(answers, data)})
+                for sub in multicall.subcalls(data):
+                    calls.append(sub)
+                continue
             calls.append((to, data))
             got = answers.get((to, data))
             if got is None:

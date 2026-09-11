@@ -3,8 +3,10 @@ import json
 import httpx
 import pytest
 
+import multicall
+from portfolio.chains import abi
 from portfolio.chains.base import Cursor, Target
-from portfolio.chains.evm import EvmAdapter
+from portfolio.chains.evm import AGGREGATE_BATCH, MULTICALL3, EvmAdapter
 from portfolio.config import TokenCfg
 from portfolio.models import Direction
 
@@ -40,6 +42,133 @@ def adapter(answers, tokens=TOKENS):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return EvmAdapter("key", tokens, client=client,
                       url_template="http://{net}/{key}"), requests
+
+
+def call_adapter(table, aggregate=True):
+    """An adapter whose eth_calls are answered from a (to, calldata) table.
+
+    `aggregate=False` makes the aggregator answer garbage, which is how a
+    network without Multicall3 behaves - the point being that the calls still
+    get answered.
+    """
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        batch = json.loads(request.content)
+        seen = []
+        out = []
+        for call in batch:
+            params = call["params"][0]
+            to, data = params["to"].lower(), params["data"]
+            if to == MULTICALL3:
+                seen.append(("aggregate", len(multicall.subcalls(data))))
+                result = (multicall.answer(table, data) if aggregate
+                          else "0xdeadbeef")
+                out.append({"jsonrpc": "2.0", "id": call["id"], "result": result})
+                continue
+            seen.append((to, data, params.get("from")))
+            got = table.get((to, data))
+            if got is None:
+                out.append({"jsonrpc": "2.0", "id": call["id"],
+                            "error": {"code": 3, "message": "execution reverted"}})
+            else:
+                out.append({"jsonrpc": "2.0", "id": call["id"], "result": got})
+        requests.append(seen)
+        return httpx.Response(200, json=out)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return EvmAdapter("key", TOKENS, client=client,
+                      url_template="http://{net}/{key}"), requests
+
+
+A, B, C = THEM, USDC, SCAM
+TABLE = {(A, "0x01"): "0x" + "11" * 32,
+         (B, "0x02"): "0x" + "22" * 32,
+         (C, "0x03"): "0x" + "33" * 32}
+
+
+async def test_a_batch_of_calls_becomes_one_call_through_the_aggregator():
+    """35 positions and 20 pools used to be 55 eth_calls, six round trips and
+    five seconds of deliberate pacing, all of it inside one tick. Through
+    Multicall3 it is one call, which the provider bills as one and the rate
+    limit never sees."""
+    a, requests = call_adapter(TABLE)
+    got = await a.eth_call_many("ethereum", [(A, "0x01"), (B, "0x02"), (C, "0x03")])
+
+    assert got == ["0x" + "11" * 32, "0x" + "22" * 32, "0x" + "33" * 32]
+    assert requests == [[("aggregate", 3)]], "one request carrying all three"
+
+
+async def test_a_reverting_call_inside_the_aggregate_answers_None():
+    """What eth_call_many has always promised: answers line up with the calls
+    and a revert is None. aggregate3 carries allowFailure per call, which is
+    the only variant that can keep that promise - the others abandon the batch
+    or refuse every failure."""
+    a, _ = call_adapter(TABLE)
+    got = await a.eth_call_many("ethereum", [(A, "0x01"), (B, "0xdead"), (C, "0x03")])
+    assert got == ["0x" + "11" * 32, None, "0x" + "33" * 32]
+
+
+async def test_a_call_that_needs_a_sender_is_never_aggregated():
+    """Through Multicall3 the sender is Multicall3. Uniswap's position manager
+    only tells the owner what collect() would pay, so aggregating that call
+    would answer zero fees - plausibly, and forever."""
+    a, requests = call_adapter(TABLE)
+    await a.eth_call_many("ethereum", [(A, "0x01"), (B, "0x02")], sender=ME)
+
+    assert requests == [[(A, "0x01", ME), (B, "0x02", ME)]]
+
+
+async def test_an_aggregator_that_cannot_answer_falls_back_to_plain_calls():
+    """A list of Nones would read as every position having closed: alerts,
+    deleted rows, terminal zeros in the history. So an answer that is not the
+    shape aggregate3 returns is not data - the calls are asked again plainly."""
+    a, requests = call_adapter(TABLE, aggregate=False)
+    got = await a.eth_call_many("ethereum", [(A, "0x01"), (B, "0x02")])
+
+    assert got == ["0x" + "11" * 32, "0x" + "22" * 32]
+    assert requests == [[("aggregate", 2)], [(A, "0x01", None), (B, "0x02", None)]]
+
+
+async def test_one_call_is_not_worth_aggregating():
+    """The wrapper costs a payload and a decode; below two calls it buys
+    nothing, and balanceOf on an empty market is exactly that case."""
+    a, requests = call_adapter(TABLE)
+    assert await a.eth_call_many("ethereum", [(A, "0x01")]) == ["0x" + "11" * 32]
+    assert requests == [[(A, "0x01", None)]]
+
+
+async def test_more_calls_than_fit_one_aggregate_are_split():
+    """Every subcall shares the outer call's gas, so the payload is bounded -
+    but by a batch size here rather than by the compute limit the plain path
+    is paced against."""
+    table = {(A, f"0x{i:02x}"): "0x" + f"{i:064x}" for i in range(1, 71)}
+    a, requests = call_adapter(table)
+    got = await a.eth_call_many("ethereum", list(table))
+
+    assert got == list(table.values())
+    assert [r[0] for r in requests] == [("aggregate", AGGREGATE_BATCH),
+                                        ("aggregate", 70 - AGGREGATE_BATCH)]
+
+
+def test_the_aggregate_payload_is_encoded_the_way_the_abi_says():
+    """Hand-built, because the struct carries bytes and is therefore dynamic:
+    the array is a count plus one offset per element, and those offsets are
+    relative to the word after the count rather than to the payload. Getting
+    that wrong still produces a plausible payload - it just dispatches the
+    wrong calldata."""
+    word = lambda n: f"{n:064x}"                                   # noqa: E731
+    payload = abi.encode_aggregate3([(A, "0xaabbccdd"), (B, "0x11")])
+
+    assert payload == (
+        abi.selector(abi.AGGREGATE3)
+        + word(0x20)                    # where the array starts
+        + word(2)                       # two calls
+        + word(0x40) + word(0xe0)       # each element, from after the count
+        + word(int(A, 16)) + word(1) + word(0x60)
+        + word(4) + "aabbccdd" + "00" * 28
+        + word(int(B, 16)) + word(1) + word(0x60)
+        + word(1) + "11" + "00" * 31)
 
 
 def transfer_doc(uid, category, value_hex, from_=THEM, to=ME, contract=None, block="0x64"):

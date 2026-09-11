@@ -420,6 +420,27 @@ async def position_managers(adapter: EvmAdapter, chain: str,
             for e, a in zip(wanted, answers)}
 
 
+async def aggregators(adapter: EvmAdapter) -> dict[str, tuple[int | None, int]]:
+    """network -> (the chain id Multicall3 reports there, the one it should).
+
+    The aggregator every tick now batches through is one hardcoded address, and
+    a wrong one does not fail loudly either: `aggregate3` on a contract that is
+    not it answers nothing usable, every call falls back to the plain path, and
+    the only symptom is a tick that quietly costs what it used to. Asking it
+    for the chain id is the cheapest question only the real one answers - and
+    it catches the address being right on some other network, which a "did it
+    answer at all" check would not.
+    """
+    from .chains.evm import MULTICALL3, NETWORKS
+
+    out = {}
+    for chain, (_, _, _, chain_id) in NETWORKS.items():
+        (answer,) = await adapter.eth_call_many(
+            chain, [(MULTICALL3, abi.selector("getChainId()"))])
+        out[chain] = (abi.decode_uint(answer), chain_id)
+    return out
+
+
 async def collect_nfts(cfg, adapter: EvmAdapter,
                        entries: list[catalog.Entry] | None = None) -> list[dict]:
     """Which addresses hold concentrated-liquidity positions, and how many.

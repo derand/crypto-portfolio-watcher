@@ -3,10 +3,11 @@ import math
 
 import httpx
 
+import multicall
 from portfolio import catalog
 from portfolio.chains.abi import encode_address, selector
 from portfolio.chains.base import Target
-from portfolio.chains.evm import EvmAdapter
+from portfolio.chains.evm import MULTICALL3, EvmAdapter
 from portfolio.protocols import ticks
 from portfolio.protocols.univ3 import UniV3Source
 
@@ -111,6 +112,10 @@ def position_answer(token0, token1, key4, lower, upper, liquidity):
                liquidity, 0, 0, 0, 0)
 
 
+INSIDE = "via-multicall3"
+"""Marks a call that rode inside an aggregate rather than costing its own."""
+
+
 def source(answers, entries, seen=None, owned=None, index_status=200):
     """`owned`: what the NFT index lists, defaulting to the one position."""
     calls = seen if seen is not None else []
@@ -127,6 +132,16 @@ def source(answers, entries, seen=None, owned=None, index_status=200):
         for call in json.loads(request.content):
             params = call["params"][0]
             to, data = params["to"].lower(), params["data"]
+            if to == MULTICALL3:
+                # The aggregate itself, then every subcall inside it - tagged,
+                # so a test can tell one round trip from the questions it
+                # carried without losing the per-call assertions.
+                calls.append(("multicall3", data, None))
+                for sub_to, sub_data in multicall.subcalls(data):
+                    calls.append((sub_to, sub_data, INSIDE))
+                out.append({"jsonrpc": "2.0", "id": call["id"],
+                            "result": multicall.answer(answers, data)})
+                continue
             calls.append((to, data, params.get("from")))
             got = answers.get((to, data))
             if got is None:
@@ -258,6 +273,37 @@ async def test_a_factory_that_could_not_be_read_is_not_remembered_as_none():
     answers[(NFPM, selector("factory()"))] = hidden
     positions, _ = await src.fetch(target())
     assert len(positions) == 2
+
+
+def crowded(ids, tick=-14377):
+    """One owner, several positions, all in the same pool."""
+    answers = market(tick)
+    answers[(NFPM, encode_address("balanceOf(address)", ME))] = enc(len(ids))
+    for token_id in ids:
+        answers[(NFPM, selector("positions(uint256)") + word(token_id))] = \
+            position_answer(WETH, USDC, 3000, LOWER, UPPER, LIQUIDITY)
+    return answers
+
+
+async def test_a_settled_market_costs_three_calls_and_one_request():
+    """The whole point of the aggregator. A tick over 35 positions in 20 pools
+    was 55 eth_calls in six paced round trips; with pool addresses, the factory
+    and token metadata already in memory, what is left is balanceOf, one
+    aggregate carrying every positions(), and the pool state - a single call
+    here only because these three positions share one pool, an aggregate of
+    twenty in the measured case."""
+    ids = [4242, 4243, 4244]
+    src, calls = source(crowded(ids), [UNI], owned=ids)
+    await src.fetch(target())               # first tick warms the caches
+
+    calls.clear()
+    positions, _ = await src.fetch(target())
+    assert len(positions) == 6, "three NFTs, two legs each"
+
+    paid = [c for c in calls if c[2] != INSIDE]
+    assert [c[0] for c in paid] == [NFPM, "nft-index", "multicall3", POOL]
+    assert len([c for c in calls if c[1].startswith(
+        selector("positions(uint256)"))]) == 3, "all three rode in the aggregate"
 
 
 async def test_uncollected_fees_are_read_only_by_the_daily_claim_path():
