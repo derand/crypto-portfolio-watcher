@@ -90,6 +90,18 @@ def _rate_calldata(signature: str, decimals: int) -> str:
     return data
 
 
+def _server_fault(error) -> bool:
+    """A JSON-RPC error that is the provider failing, not the question.
+
+    Alchemy answers `-32603 Internal error` inside an otherwise good batch
+    now and then; asking the same batch again usually gets the data. A revert
+    or a bad parameter is a final answer and must not be asked twice.
+    """
+    if not isinstance(error, dict):
+        return False
+    return error.get("code") == -32603 or error.get("message") == "Internal error"
+
+
 def _hex(value) -> int:
     if value in (None, "", "0x"):
         return 0
@@ -177,20 +189,35 @@ class EvmAdapter:
                 raise RuntimeError(f"alchemy {scope}: HTTP {r.status_code}")
             return r.json()
 
-        try:
-            body = await with_retry(call, what=f"alchemy {scope}",
-                                    attempts=attempts, base=base)
-        except Unavailable as e:
-            raise Unavailable(redact(str(e), self._key)) from None
-        if isinstance(body, dict):
-            body = [body]
-        by_id = {item["id"]: item for item in body}
+        # A server fault arrives as HTTP 200 with an error inside the batch, so
+        # with_retry never sees it. It is asked again once, not three times: it
+        # has come twice in two days and cleared by the next tick each time, and
+        # a fault that is not passing would cost three batches on every tick.
+        for resend in (False, True):
+            try:
+                body = await with_retry(call, what=f"alchemy {scope}",
+                                        attempts=attempts, base=base)
+            except Unavailable as e:
+                raise Unavailable(redact(str(e), self._key)) from None
+            if isinstance(body, dict):
+                body = [body]
+            by_id = {item["id"]: item for item in body}
+            answers = [by_id.get(item["id"], {}) for item in payload]
+            faults = [a["error"] for a in answers if _server_fault(a.get("error"))]
+            if not faults or resend:
+                break
+            log.warning("alchemy %s: %s; asking once more",
+                        scope, faults[0].get("message", ""))
+            await asyncio.sleep(base)
         out = []
-        for item in payload:
-            got = by_id.get(item["id"], {})
+        for item, got in zip(payload, answers):
             if "error" in got:
                 msg = got["error"].get("message", "")
                 if not allow_errors:
+                    if _server_fault(got["error"]):
+                        # Skipped for this tick, not broken: the next one asks again.
+                        raise Unavailable(
+                            f"alchemy {item['method']} on {scope}: {msg} (twice)")
                     raise Permanent(f"alchemy {item['method']} on {scope}: {msg}")
                 log.debug("%s on %s: %s", item["method"], scope, msg)
                 out.append(None)

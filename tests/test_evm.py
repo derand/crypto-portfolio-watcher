@@ -609,6 +609,75 @@ async def test_a_provider_error_never_carries_the_api_key():
     assert "429" in str(caught.value), "the status is what the reader needs"
 
 
+def _internal_error_then(faults, monkeypatch):
+    """A provider whose first `faults` batches carry -32603 on every call."""
+    monkeypatch.setattr("portfolio.chains.evm.asyncio.sleep", _no_sleep)
+    sent = []
+
+    def handler(request):
+        batch = json.loads(request.content)
+        sent.append(batch)
+        if len(sent) <= faults:
+            return httpx.Response(200, json=[
+                {"jsonrpc": "2.0", "id": c["id"],
+                 "error": {"code": -32603, "message": "Internal error"}}
+                for c in batch])
+        return httpx.Response(200, json=[
+            {"jsonrpc": "2.0", "id": c["id"], "result": BALANCES[c["method"]]}
+            for c in batch])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return EvmAdapter("k", TOKENS, client=client,
+                      url_template="http://{net}/{key}"), sent
+
+
+async def _no_sleep(_):
+    return None
+
+
+async def test_an_alchemy_internal_error_is_asked_once_more(monkeypatch):
+    """Alchemy answers `Internal error` inside an HTTP 200 now and then (twice in
+    two days in production). It used to be Permanent: no second attempt and a
+    traceback in the log, although asking again gets the data."""
+    a, sent = _internal_error_then(1, monkeypatch)
+    probe = await a.probe(target(), "ethereum", Cursor())
+    assert len(sent) == 2
+    assert probe.marker
+
+
+async def test_an_internal_error_twice_skips_the_scope_for_this_tick(monkeypatch):
+    """Two in a row is not worth a third batch on every tick: the scope becomes
+    Unavailable - a quiet line and the next tick asks again - never Permanent."""
+    from portfolio.retry import Unavailable
+
+    a, sent = _internal_error_then(99, monkeypatch)
+    with pytest.raises(Unavailable, match="Internal error"):
+        await a.probe(target(), "ethereum", Cursor())
+    assert len(sent) == 2, "one resend, not three"
+
+
+async def test_a_final_rpc_error_is_not_asked_again(monkeypatch):
+    """A bad parameter answers the same every time; resending it only doubles
+    the compute units spent on a question that already has its answer."""
+    from portfolio.retry import Permanent
+
+    monkeypatch.setattr("portfolio.chains.evm.asyncio.sleep", _no_sleep)
+    sent = []
+
+    def handler(request):
+        batch = json.loads(request.content)
+        sent.append(batch)
+        return httpx.Response(200, json=[
+            {"jsonrpc": "2.0", "id": c["id"],
+             "error": {"code": -32602, "message": "invalid params"}} for c in batch])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    a = EvmAdapter("k", {}, client=client, url_template="http://{net}/{key}")
+    with pytest.raises(Permanent):
+        await a.probe(target(), "ethereum", Cursor())
+    assert len(sent) == 1
+
+
 def test_redact_leaves_short_strings_alone():
     """A one-character or empty key would turn every message into asterisks;
     an unset key is empty, and adapters are constructed with it routinely."""
