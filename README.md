@@ -20,6 +20,8 @@ Python 3.12+ and the packages in `requirements.txt` (`httpx`, `pydantic`,
 Free-tier API keys are enough for a handful of addresses: Alchemy for EVM,
 Etherscan for beacon withdrawals, CoinGecko for prices, a Telegram bot token to
 be notified. `.env.example` lists them and says which phase needs which.
+[SETUP.md](SETUP.md) says where to get each key and how to run the watcher on a
+free Oracle Cloud VM.
 
 ## Running
 
