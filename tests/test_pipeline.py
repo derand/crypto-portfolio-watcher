@@ -6,6 +6,7 @@ from portfolio import pipeline
 from portfolio.chains.base import AddressState, Cursor, Target
 from portfolio.models import (BalanceSnapshot, Direction, Position, Probe,
                               Trade, Transfer)
+from portfolio.protocols.hyperliquid import HyperliquidSource
 
 A1 = "bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97"
 A2 = "bc1q9qkjc8x853msxzsykp5qc5hjc0uav8ak4wwj5q"
@@ -469,9 +470,10 @@ class FakeSource:
     async def fetch(self, t):
         snapshot = self.script[min(self.step, len(self.script) - 1)]
         self.step += 1
-        marker = "|".join(f"{p.key}={p.amount_raw}"
-                          for p in snapshot if p.key != "account")
-        return list(snapshot), marker
+        # The real source's marker, not a restatement of it: what the marker
+        # leaves out decides which ticks the pipeline ever diffs, and a fake
+        # with its own idea of that proves nothing about the real one.
+        return list(snapshot), HyperliquidSource.marker(snapshot)
 
 
 class TradingSource(FakeSource):
@@ -606,10 +608,14 @@ async def test_account_value_drift_never_alerts(tmp_path):
 
 
 async def test_liquidation_warning_fires_and_then_stays_quiet(tmp_path):
+    """The size never moves here on purpose. The distance to liquidation drifts
+    with the mark price alone, and the warning has to come from that drift:
+    these tests used to nudge the size by one base unit per scan, and that
+    nudge was the only reason the pipeline looked at the position at all."""
     cfg, conn = setup_hl(tmp_path)
     src = FakeSource([[account(), perp(liq_pct=40.0)],
-                      [account(), perp(size=150000001, liq_pct=8.3)],
-                      [account(), perp(size=150000002, liq_pct=8.4)]])
+                      [account(), perp(liq_pct=8.3)],
+                      [account(), perp(liq_pct=8.4)]])
     router = FakeRouter()
     for _ in range(3):
         await run_hl(cfg, conn, router, src)
@@ -621,14 +627,65 @@ async def test_liquidation_warning_fires_and_then_stays_quiet(tmp_path):
 async def test_liquidation_warning_repeats_when_risk_worsens(tmp_path):
     cfg, conn = setup_hl(tmp_path)
     src = FakeSource([[account(), perp(liq_pct=40.0)],
-                      [account(), perp(size=150000001, liq_pct=8.3)],
-                      [account(), perp(size=150000002, liq_pct=4.1)]])
+                      [account(), perp(liq_pct=8.3)],
+                      [account(), perp(liq_pct=4.1)]])
     router = FakeRouter()
     for _ in range(3):
         await run_hl(cfg, conn, router, src)
     warned = [m.body for m in router.sent if m.severity.value == "high"]
     assert len(warned) == 2
     assert "4.1%" in warned[1]
+
+
+async def test_a_recovered_position_is_not_warned_twice_at_the_same_percent(tmp_path):
+    """Back out of danger and down again to a percent already warned about is
+    the same position telling the same story; only a new low is news."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), perp(liq_pct=40.0)],
+                      [account(), perp(liq_pct=8.3)],
+                      [account(), perp(liq_pct=40.0)],
+                      [account(), perp(liq_pct=8.9)],
+                      [account(), perp(liq_pct=7.9)]])
+    router = FakeRouter()
+    for _ in range(5):
+        await run_hl(cfg, conn, router, src)
+    warned = [m.body for m in router.sent if m.severity.value == "high"]
+    assert len(warned) == 2, warned
+    assert "8.3%" in warned[0] and "7.9%" in warned[1]
+
+
+async def test_the_next_position_on_a_coin_is_warned_afresh(tmp_path):
+    """A warning belongs to one life of a position. The old rule deduplicated
+    on the state alone, so once any ETH perp had been warned at 8%, no later
+    ETH perp ever was - for the life of the database."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), perp(liq_pct=40.0)],
+                      [account(), perp(liq_pct=8.3)],
+                      [account()],
+                      [account(), perp(size=200000000, liq_pct=40.0)],
+                      [account(), perp(size=200000000, liq_pct=8.9)]])
+    router = FakeRouter()
+    for _ in range(5):
+        await run_hl(cfg, conn, router, src)
+    warned = [m.body for m in router.sent if m.severity.value == "high"]
+    assert len(warned) == 2, warned
+    assert "8.9%" in warned[1]
+
+
+async def test_a_position_reopened_at_the_same_size_alerts_again(tmp_path):
+    """Somebody who always trades 1.5 ETH opens and closes the same position
+    every week. Each open and each close is an event; a uid built from the
+    size alone made every one after the first a "duplicate"."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account()],
+                      [account(), perp()], [account()],
+                      [account(), perp()], [account()]])
+    router = FakeRouter()
+    for _ in range(5):
+        await run_hl(cfg, conn, router, src)
+    bodies = [m.body for m in router.sent]
+    assert len(bodies) == 4, bodies
+    assert [b.split()[1] for b in bodies] == ["opened", "closed", "opened", "closed"]
 
 
 class FakePrices:
@@ -1162,6 +1219,22 @@ async def test_a_position_first_seen_out_of_range_does_not_alert(tmp_path):
     for _ in range(2):
         await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
     assert router.sent == []
+
+
+async def test_leaving_the_range_twice_is_said_twice(tmp_path):
+    """The fake reports the same tick every time, which is what a price
+    oscillating at the edge of the range looks like. Each exit is a new
+    transition; a uid carrying only the state and the tick made the second
+    one a duplicate of the first."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+    src = FakeRangeSource(["true", "false", "true", "false"])
+    for _ in range(4):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
+
+    said = [m.body for m in router.sent]
+    assert [("left" in b, "back" in b) for b in said] == [
+        (True, False), (False, True), (True, False)]
 
 
 async def test_the_drifting_amount_of_a_range_position_stays_silent(tmp_path):

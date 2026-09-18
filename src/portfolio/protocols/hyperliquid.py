@@ -83,12 +83,31 @@ class HyperliquidSource:
 
         positions = (self._account(perp) + self._perps(perp) + self._spot(spot)
                      + self._staking(stake))
-        # The marker deliberately excludes unrealised PnL: it drifts every second
-        # with the mark price, and treating that as "something changed" would make
-        # every tick look busy while telling us nothing.
-        marker = "|".join(f"{p.key}={p.amount_raw}"
-                          for p in positions if p.key != "account")
-        return positions, marker
+        return positions, self.marker(positions)
+
+    @staticmethod
+    def marker(positions: list[Position]) -> str:
+        """Sizes, plus the whole percent each perp sits from liquidation.
+
+        Unrealised PnL is deliberately left out: it drifts every second with the
+        mark price, and treating that as "something changed" would make every
+        tick look busy while telling us nothing. The distance to liquidation
+        moves with the same price, but only its whole-percent bucket is here -
+        the same trick as the tick bucket in univ3 - because a change of bucket
+        is the one thing about a drifting position that is worth a diff. Left
+        out, the liquidation warning was only ever evaluated on a tick where a
+        size happened to move, which in practice meant "when funding settled".
+        """
+        parts = []
+        for p in positions:
+            if p.key == "account":
+                continue
+            part = f"{p.key}={p.amount_raw}"
+            distance = p.extra.get("liq_distance_pct")
+            if distance is not None:
+                part += f"@{int(float(distance))}"
+            parts.append(part)
+        return "|".join(parts)
 
     async def trades(self, t: Target, since_ms: int | None = None) -> dict[str, Trade]:
         """What the positions that just closed or shrank actually made.

@@ -713,22 +713,27 @@ def _record_position_snapshot(conn, address_id: int, protocol: str, key: str,
 def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
                     amount_raw: int, kind: str = EventKind.POSITION_CHANGE.value,
                     pnl_usd: float | None = None,
-                    usd: float | None = None) -> int | None:
-    """Insert one position event; None if it was already recorded.
+                    usd: float | None = None) -> int:
+    """Insert one position event.
 
-    The uid carries the new state, so an unchanged position produces the same
-    uid and is deduplicated by the database rather than by careful bookkeeping.
+    No lookup before the insert, and the uid is stamped with the time, like an
+    accrual's. It used to be the new state alone - "perp:ETH:150000000" - and
+    an existing uid meant "already recorded". But nothing here can be recorded
+    twice: the insert and the cursor advance commit together, and the marker
+    gate keeps an unchanged state from reaching this code at all. What the
+    check actually did was silence every *repeat* of a state - the second open
+    of the same 1.5 ETH, the second close, the next position on that coin
+    reaching the same percent from liquidation - for the life of the database.
+    Whether something is worth saying is decided by the callers, from what was
+    stored last tick; the uid only has to be unique.
     """
-    existing = conn.execute(
-        "SELECT id FROM events WHERE chain=? AND address_id=? AND kind=? AND uid=?",
-        (chain, address_id, kind, uid)).fetchone()
-    if existing:
-        return None
+    now = _now()
     cur = conn.execute(
         """INSERT INTO events(chain, scope, address_id, tx_hash, uid, kind,
                               amount_raw, usd, ts, status, detail, pnl_usd)
            VALUES (?,'',?,'',?,?,?,?,?, 'confirmed', ?, ?)""",
-        (chain, address_id, uid, kind, str(amount_raw), usd, _now(), detail, pnl_usd))
+        (chain, address_id, f"{uid}:{now}", kind, str(amount_raw), usd, now,
+         detail, pnl_usd))
     return cur.lastrowid
 
 
@@ -828,12 +833,12 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                 shown = None if p.extra.get("side") else moved
                 if before is None:
                     eid = _position_event(
-                        conn, chain, address_id, f"{p.key}:{p.amount_raw}",
+                        conn, chain, address_id, f"{p.key}:0>{p.amount_raw}",
                         _opened_text(p, shown), p.amount_raw, usd=shown)
                 elif before != p.amount_raw:
                     trade = trades.get(p.key)
                     eid = _position_event(
-                        conn, chain, address_id, f"{p.key}:{p.amount_raw}",
+                        conn, chain, address_id, f"{p.key}:{before}>{p.amount_raw}",
                         _changed_text(p, before, shown) + _trade_tail(trade),
                         p.amount_raw,
                         pnl_usd=trade.pnl_usd if trade else None, usd=shown)
@@ -870,7 +875,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
             trade = trades.get(key)
             worth = (None if _extra(row).get("side") else
                      _usd_of(prices, row["asset_key"], before, row["decimals"] or 8))
-            eid = _position_event(conn, chain, address_id, f"{key}:closed:{before}",
+            eid = _position_event(conn, chain, address_id, f"{key}:{before}>closed",
                                   _closed_text(key, before, row, trade, worth), before,
                                   pnl_usd=trade.pnl_usd if trade else None, usd=worth)
             if eid:
@@ -1061,7 +1066,7 @@ def _state_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
     both are noise - yet each can cross a line that is worth exactly one
     message: liquidation coming close, liquidity falling out of range.
     """
-    return (_liq_event(conn, cfg, chain, address_id, p)
+    return (_liq_event(conn, cfg, chain, address_id, p, prev)
             or _range_event(conn, chain, address_id, p, prev))
 
 
@@ -1092,23 +1097,45 @@ def _range_event(conn, chain: str, address_id: int, p, prev) -> int | None:
     else:
         text = f"{venue} #{pair} {p.symbol} is back in range and earning again"
     return _position_event(
-        conn, chain, address_id, f"{p.key}:range:{now}:{p.extra.get('tick', '')}",
-        text, p.amount_raw)
+        conn, chain, address_id, f"{p.key}:range:{now}", text, p.amount_raw)
 
 
-def _liq_event(conn, cfg, chain: str, address_id: int, p) -> int | None:
+LIQ_WARNED = "liq_warned"
+"""Key in a position's stored `extra`: the lowest whole percent from liquidation
+this position has been warned about. Carried forward by `_liq_event` from one
+tick to the next, and gone with the row when the position closes - which is what
+scopes "once per percent" to one life of the position rather than to the
+database. The source never writes it; the pipeline does, just before the row is
+stored."""
+
+
+def _liq_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
     """Warn once per percentage point as a position approaches liquidation.
 
     Bucketing by whole percent is what stops this from firing every tick while
-    still speaking up again when the risk gets worse.
+    still speaking up again when the risk gets worse. "Worse" is measured
+    against the lowest bucket already warned about on *this* position, read
+    from what was stored last tick: a new position on the same coin starts with
+    a clean slate, and a position that recovers and then falls back to a
+    percent it was already warned at stays quiet, as before.
+
+    Reached at all only because the source puts the bucket in its marker; a
+    source whose marker ignores the distance would only get here when a size
+    moved, which is the failure this replaces.
     """
     raw = p.extra.get("liq_distance_pct")
     if raw is None:
         return None
+    warned = _extra(prev).get(LIQ_WARNED) if prev is not None else None
+    if warned is not None:
+        p.extra[LIQ_WARNED] = warned         # carry forward, whatever happens below
     distance = float(raw)
     if distance > cfg.thresholds.liq_distance_pct:
         return None
     bucket = int(distance)
+    if warned is not None and bucket >= int(warned):
+        return None
+    p.extra[LIQ_WARNED] = str(bucket)
     return _position_event(
         conn, chain, address_id, f"{p.key}:liq:{bucket}",
         f"{p.symbol} {p.extra.get('side', '')} within {distance:.1f}% of liquidation "

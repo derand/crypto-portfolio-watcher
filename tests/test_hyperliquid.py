@@ -106,6 +106,24 @@ async def test_marker_changes_when_a_position_size_changes():
     assert first != second
 
 
+async def test_marker_moves_with_the_whole_percent_from_liquidation():
+    """The size is the same in all three; only the mark price moved. Within one
+    percent of distance that is drift and the tick must stay cheap; across a
+    percent boundary the pipeline has to look, or the liquidation warning is
+    only ever evaluated when a size happens to change."""
+    def at(mark_value):
+        s, _ = source(perp_state([position(value=mark_value)]), spot_state())
+        return s
+    # liq 2400, size 1.5: value 4530 -> mark 3020, 20.5% away; 4515 -> 3010,
+    # 20.3%; 4485 -> 2990, 19.7%; 3750 -> 2500, 4%.
+    _, twenty = await at("4530.0").fetch(TARGET)
+    _, still_twenty = await at("4515.0").fetch(TARGET)
+    _, nineteen = await at("4485.0").fetch(TARGET)
+    _, four = await at("3750.0").fetch(TARGET)
+    assert twenty == still_twenty
+    assert len({twenty, nineteen, four}) == 3
+
+
 async def test_zero_size_positions_are_dropped():
     s, _ = source(perp_state([position(szi="0.0")]), spot_state())
     positions, _ = await s.fetch(TARGET)
