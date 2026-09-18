@@ -38,7 +38,9 @@ from ..chains.abi import decode_address, decode_uint, decode_string, selector
 from ..chains.base import Target
 from ..chains.evm import EvmAdapter
 from ..models import Position
+from ..retry import Unavailable
 from . import ticks as tickmath
+from .univ3 import _answered
 
 log = logging.getLogger(__name__)
 
@@ -146,17 +148,20 @@ class UniV4Source:
         return self._managers[key]
 
     async def _market(self, t: Target, chain: str, entry):
+        where = f"{t.label}/{entry.protocol}"
         ids = await self._adapter.owned_nfts(chain, t.address, entry.address)
         if not ids:
             return [], []
         manager = await self._pool_manager(chain, entry)
-        if manager is None:
-            return [], []
+        _answered([manager], "poolManager()", where)
 
         call = self._adapter.eth_call_many
+        # None is refused, zero is a position whose liquidity was withdrawn
+        # while the NFT stayed in the wallet - the same reading as v3's.
         liquidity = [decode_uint(a) for a in await call(
             chain, [(entry.address, selector("getPositionLiquidity(uint256)")
                      + f"{i:064x}") for i in ids])]
+        _answered(liquidity, "getPositionLiquidity()", where)
         live = [i for i, amount in zip(ids, liquidity) if amount]
         amounts = {i: a for i, a in zip(ids, liquidity) if a}
         if not live:
@@ -166,10 +171,9 @@ class UniV4Source:
             (entry.address, selector("getPoolAndPositionInfo(uint256)") + f"{i:064x}")
             for i in live])
 
+        _answered([_word(a, 5) for a in infos], "getPoolAndPositionInfo()", where)
         parsed = []
         for token_id, answer in zip(live, infos):
-            if _word(answer, 5) is None:
-                continue
             currency0, currency1 = _word(answer, 0), _word(answer, 1)
             fee, spacing = _word(answer, 2), _signed(_word(answer, 3))
             hooks = _word(answer, 4)
@@ -178,10 +182,12 @@ class UniV4Source:
             if int.from_bytes(pid, "big") >> 56 != stored_id:
                 # The NFT stores the top 200 bits of the pool id it belongs to.
                 # Disagreeing means the key was assembled wrongly, and every
-                # number that follows would be read from another pool's storage.
-                log.warning("%s: position %s does not match the pool key it names",
-                            entry.label, token_id)
-                continue
+                # number that follows would be read from another pool's
+                # storage. Skipping the position would report it as closed;
+                # this is a bug in the reader, and it should be visible in
+                # /health for as long as it lasts.
+                raise Unavailable(f"{where}: position {token_id} does not match "
+                                  f"the pool key it names")
             parsed.append({
                 "id": token_id, "pid": pid,
                 "token0": f"0x{currency0:040x}", "token1": f"0x{currency1:040x}",
@@ -193,21 +199,17 @@ class UniV4Source:
         slots = sorted({state_slot(p["pid"]) for p in parsed})
         answers = await call(chain, [(manager, selector("extsload(bytes32)") + s[2:])
                                      for s in slots])
-        state = {}
-        for slot, answer in zip(slots, answers):
-            got = unpack_slot0(decode_uint(answer))
-            if got:
-                state[slot] = got
+        # unpack_slot0 answers None for an unset pool as well as for no
+        # answer; a pool holding a live position is neither.
+        state = {slot: unpack_slot0(decode_uint(answer))
+                 for slot, answer in zip(slots, answers)}
+        _answered(list(state.values()), "extsload(slot0)", where)
 
-        await self._resolve_meta(chain, parsed)
+        await self._resolve_meta(chain, parsed, where)
 
         out, marks = [], []
         for p in parsed:
-            got = state.get(state_slot(p["pid"]))
-            if got is None:
-                log.warning("%s: no pool state for position %s", entry.label, p["id"])
-                continue
-            sqrt_price, tick = got
+            sqrt_price, tick = state[state_slot(p["pid"])]
             amount0, amount1 = tickmath.amounts_for_liquidity(
                 sqrt_price, p["lower"], p["upper"], p["liquidity"])
             inside = tickmath.in_range(tick, p["lower"], p["upper"])
@@ -232,7 +234,8 @@ class UniV4Source:
                          f"{p['upper']}:{int(inside)}:{tick // MARKER_TICK_BUCKET}")
         return out, marks
 
-    async def _resolve_meta(self, chain: str, parsed: list[dict]) -> None:
+    async def _resolve_meta(self, chain: str, parsed: list[dict], where: str) -> None:
+        """Same rule as v3's: nothing is remembered without its decimals."""
         wanted = []
         for p in parsed:
             for contract in (p["token0"], p["token1"]):
@@ -247,7 +250,8 @@ class UniV4Source:
             calls += [(contract, selector("symbol()")),
                       (contract, selector("decimals()"))]
         answers = await self._adapter.eth_call_many(chain, calls)
+        decimals = [decode_uint(answers[i * 2 + 1]) for i in range(len(wanted))]
+        _answered(decimals, "decimals()", where)
         for i, contract in enumerate(wanted):
-            decimals = decode_uint(answers[i * 2 + 1])
             self._meta[(chain, contract)] = (decode_string(answers[i * 2]) or "",
-                                             18 if decimals is None else decimals)
+                                             decimals[i])

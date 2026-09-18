@@ -3,6 +3,7 @@ import pytest
 
 from portfolio.chains.base import Target
 from portfolio.protocols.beacon import BeaconSource
+from portfolio.retry import Unavailable
 
 ME = "0xbeac017a3c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f"
 TARGET = Target(address=ME, label="stake-1", watch=frozenset({"beacon"}))
@@ -70,3 +71,14 @@ async def test_marker_ignores_epoch_drift_but_never_a_status_change():
     assert m_a == m_b, "a rounding-level tick is not news"
     assert m_a != m_c, "a real reward is"
     assert m_a != m_d, "and an exit certainly is"
+
+
+async def test_a_validator_the_answer_leaves_out_costs_the_tick():
+    """An exit is a status and the row stays; a validator simply absent from
+    the answer is a short answer. Read as data it closes the position - a
+    terminal zero in the history and a "closed validator" alert over 32 ETH
+    that never moved."""
+    s, _ = source([validator(1)], validators={ME: [1, 2]})
+    with pytest.raises(Unavailable) as e:
+        await s.fetch(TARGET)
+    assert "2" in str(e.value)

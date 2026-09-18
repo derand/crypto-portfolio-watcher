@@ -637,6 +637,30 @@ async def test_liquidation_warning_repeats_when_risk_worsens(tmp_path):
     assert "4.1%" in warned[1]
 
 
+async def test_a_source_that_cannot_answer_keeps_every_position_it_had(tmp_path):
+    """The property every "None is not data" rule in the sources relies on:
+    an Unavailable tick leaves the stored positions exactly as they were - no
+    delete, no terminal zero, no "closed" alert - and the next good tick
+    carries on from there."""
+    cfg, conn = setup_hl(tmp_path)
+
+    class Flaky(FakeSource):
+        async def fetch(self, t):
+            if self.step == 1:
+                self.step += 1
+                raise Unavailable("hyperliquid clearinghouseState failed")
+            return await super().fetch(t)
+
+    src = Flaky([[account(), perp()], [account(), perp()], [account(), perp()]])
+    router = FakeRouter()
+    results = [await run_hl(cfg, conn, router, src) for _ in range(3)]
+    assert results[1].failed and not results[0].failed and not results[2].failed
+    assert router.sent == []
+    assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='perp:ETH'"
+                        ).fetchone()[0] == 1
+    assert await _history(conn, "perp:ETH") == ["150000000"]
+
+
 async def test_a_recovered_position_is_not_warned_twice_at_the_same_percent(tmp_path):
     """Back out of danger and down again to a percent already warned about is
     the same position telling the same story; only a new low is news."""

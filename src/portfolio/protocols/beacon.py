@@ -21,7 +21,7 @@ import httpx
 
 from ..chains.base import Target
 from ..models import Position
-from ..retry import with_retry
+from ..retry import Unavailable, with_retry
 
 log = logging.getLogger(__name__)
 
@@ -66,8 +66,20 @@ class BeaconSource:
         if not indexes:
             return [], ""
 
+        states = await self._states(indexes)
+        # Every index asked for has to come back. A validator the answer
+        # leaves out is not one that exited - an exit is a status, and the row
+        # stays - it is an answer that is short, and read as data it would
+        # close the position: a terminal zero in the history and a "closed
+        # validator" alert over 32 ETH that never moved.
+        got = {str(e.get("index")) for e in states}
+        missing = [i for i in indexes if str(i) not in got]
+        if missing:
+            raise Unavailable(f"{t.label}/beacon: no answer for validator(s) "
+                              f"{', '.join(str(i) for i in missing)}")
+
         positions = []
-        for entry in await self._states(indexes):
+        for entry in states:
             index = entry.get("index")
             balance = int(entry.get("balance", 0)) * GWEI
             validator = entry.get("validator") or {}

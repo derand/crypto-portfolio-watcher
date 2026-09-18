@@ -4,11 +4,13 @@ import httpx
 from eth_utils import keccak
 
 import multicall
+import pytest
 from portfolio import catalog
 from portfolio.chains.abi import selector
 from portfolio.chains.base import Target
 from portfolio.chains.evm import MULTICALL3, EvmAdapter
 from portfolio.protocols import ticks
+from portfolio.retry import Unavailable
 from portfolio.protocols.univ4 import (POOLS_SLOT, UniV4Source, pool_id,
                                        state_slot, unpack_info, unpack_slot0)
 
@@ -187,13 +189,30 @@ async def test_native_eth_is_a_currency_and_is_not_asked_for_a_symbol():
     assert not any(c[0] == NATIVE for c in calls)
 
 
-async def test_a_position_whose_key_does_not_match_its_pool_is_skipped():
+async def test_a_position_whose_key_does_not_match_its_pool_costs_the_tick():
     """The NFT stores the top 200 bits of the pool id it belongs to. If the key
     we hashed disagrees, every figure that follows would be read out of another
-    pool's storage - which is worse than reporting nothing."""
+    pool's storage. Reporting nothing is not the answer either: to the pipeline
+    an absent position is a closed one. This is a bug in the reader, and it
+    belongs in /health for as long as it lasts."""
     src, _ = source(market(-14377, break_key=True), [TOKEN_ID], [ENTRY])
-    positions, marker = await src.fetch(target())
-    assert positions == [] and marker == ""
+    with pytest.raises(Unavailable):
+        await src.fetch(target())
+
+
+@pytest.mark.parametrize("call", ["getPositionLiquidity(uint256)",
+                                  "getPoolAndPositionInfo(uint256)",
+                                  "extsload(bytes32)", "decimals()"])
+async def test_an_unanswered_question_about_a_held_position_costs_the_tick(call):
+    """Same rule as v3, and more exposed: there is no balanceOf here to notice
+    a list that came back short."""
+    answers = market(-14377)
+    for key in [k for k in answers if k[1].startswith(selector(call))]:
+        answers.pop(key)
+    src, _ = source(answers, [TOKEN_ID], [ENTRY])
+    with pytest.raises(Unavailable) as e:
+        await src.fetch(target())
+    assert call.split("(")[0] in str(e.value)
 
 
 async def test_a_closed_position_is_not_reported():

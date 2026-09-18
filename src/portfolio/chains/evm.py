@@ -222,7 +222,13 @@ class EvmAdapter:
                 log.debug("%s on %s: %s", item["method"], scope, msg)
                 out.append(None)
                 continue
-            out.append(got.get("result"))
+            result = got.get("result")
+            if result is None and not allow_errors:
+                # An id the batch did not answer, or a null result: neither is
+                # a number, and `_hex` would read either as zero. A probe that
+                # half worked is a probe that lies, so the tick is skipped.
+                raise Unavailable(f"alchemy {item['method']} on {scope}: no answer")
+            out.append(result)
         return out
 
     async def eth_call_many(self, scope: str, calls: list[tuple[str, str]],
@@ -438,10 +444,31 @@ class EvmAdapter:
         native = _hex(results[1])
         token_balances = {}
         if contracts:
+            # A balance the provider could not read arrives as a null with an
+            # `error` beside it, and a contract it did not answer for is simply
+            # absent. Both used to become zero - which, after a real balance,
+            # is an anomaly alert, or for a yield-bearing token a silent
+            # negative "vault yield" and a zeroed row. Unknown is not zero.
             for entry in (results[2] or {}).get("tokenBalances", []):
-                token_balances[entry["contractAddress"].lower()] = _hex(entry.get("tokenBalance"))
+                raw = entry.get("tokenBalance")
+                if entry.get("error") or raw is None:
+                    raise Unavailable(f"alchemy {scope}: no balance for "
+                                      f"{entry.get('contractAddress')}: "
+                                      f"{entry.get('error') or 'null'}")
+                token_balances[entry["contractAddress"].lower()] = _hex(raw)
+            missing = [c for c in contracts if c not in token_balances]
+            if missing:
+                raise Unavailable(f"alchemy {scope}: {len(missing)} of "
+                                  f"{len(contracts)} token balances unanswered")
         rates = {tok.contract: _hex(raw) for tok, raw
                  in zip(rate_tokens, results[3 if contracts else 2:])}
+        for tok in rate_tokens:
+            if not rates[tok.contract]:
+                # "0x" from a contract without the method, or a vault answering
+                # zero: either way the shares cannot be valued this tick, and
+                # reporting them unscaled would read as the holding collapsing.
+                raise Unavailable(f"alchemy {scope}: {tok.symbol} {tok.rate_call} "
+                                  f"answered nothing")
 
         parts = [str(native)] + [f"{k}={v}" for k, v in sorted(token_balances.items())]
         # The rate drifts every block. At full precision it would make every tick

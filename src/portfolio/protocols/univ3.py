@@ -39,6 +39,7 @@ from ..chains.abi import decode_address, decode_uint, decode_string, selector
 from ..chains.base import Target
 from ..chains.evm import EvmAdapter
 from ..models import Position
+from ..retry import Unavailable
 from . import ticks as tickmath
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,22 @@ def _word(data, index: int) -> int | None:
     if len(body) < WORD * (index + 1):
         return None
     return int.from_bytes(body[index * WORD:(index + 1) * WORD], "big")
+
+
+def _answered(values, what: str, where: str) -> None:
+    """Refuse a tick in which a call about a held position went unanswered.
+
+    `eth_call_many` answers None for a revert and for a call the provider did
+    not serve, and here the two are the same thing: none of the questions asked
+    of a position the owner demonstrably holds can revert, so a None is the
+    provider's problem. Read as data it was a closed position - the state row
+    deleted, a terminal zero written into the history that nothing takes back,
+    and a "closed" alert for each leg - over a fault that cleared on the next
+    tick. An `Unavailable` costs the tick and nothing else.
+    """
+    missing = sum(1 for v in values if v is None)
+    if missing:
+        raise Unavailable(f"{where}: {what} unanswered for {missing} of {len(values)}")
 
 
 class UniV3Source:
@@ -175,23 +192,26 @@ class UniV3Source:
         answers = await self._adapter.eth_call_many(chain, [
             (entry.address, selector("tokenOfOwnerByIndex(address,uint256)")
              + f"{int(t.address, 16):064x}{i:064x}") for i in range(held)])
-        return [i for i in (decode_uint(a) for a in answers) if i is not None]
+        ids = [decode_uint(a) for a in answers]
+        _answered(ids, "tokenOfOwnerByIndex()", f"{t.label}/{entry.protocol}")
+        return ids
 
     async def _market(self, t: Target, chain: str, entry):
         nfpm = entry.address
+        where = f"{t.label}/{entry.protocol}"
         call = self._adapter.eth_call_many
         (count,) = await call(chain, [(nfpm, selector("balanceOf(address)")
                                        + f"{int(t.address, 16):064x}")])
-        held = decode_uint(count) or 0
+        held = decode_uint(count)
+        _answered([held], "balanceOf()", where)
         if not held:
             return [], []
 
         ids = await self._ids(t, chain, entry, held)
-        if not ids:
-            return [], []
 
         raw = await call(chain, [(nfpm, selector("positions(uint256)") + f"{i:064x}")
                                  for i in ids])
+        _answered([_word(a, 7) for a in raw], "positions()", where)
         parsed = []
         for token_id, answer in zip(ids, raw):
             liquidity = _word(answer, 7)
@@ -209,18 +229,13 @@ class UniV3Source:
         if not parsed:
             return [], []
 
-        await self._resolve_pools(chain, entry, parsed)
-        slots = await self._slots(chain, parsed)
-        await self._resolve_meta(chain, parsed)
+        await self._resolve_pools(chain, entry, parsed, where)
+        slots = await self._slots(chain, parsed, where)
+        await self._resolve_meta(chain, parsed, where)
 
         out, marks = [], []
         for p in parsed:
-            slot = slots.get(p["pool"])
-            if slot is None:
-                log.warning("%s/%s: no pool state for position %s",
-                            t.label, entry.label, p["id"])
-                continue
-            sqrt_price, tick = slot
+            sqrt_price, tick = slots[p["pool"]]
             amount0, amount1 = tickmath.amounts_for_liquidity(
                 sqrt_price, p["lower"], p["upper"], p["liquidity"])
             inside = tickmath.in_range(tick, p["lower"], p["upper"])
@@ -247,8 +262,16 @@ class UniV3Source:
                          f"{p['upper']}:{int(inside)}:{tick // MARKER_TICK_BUCKET}")
         return out, marks
 
-    async def _resolve_pools(self, chain: str, entry, parsed: list[dict]) -> None:
-        """Ask the factory once per (pair, fee) and remember the answer."""
+    async def _resolve_pools(self, chain: str, entry, parsed: list[dict],
+                             where: str) -> None:
+        """Ask the factory once per (pair, fee) and remember the answer.
+
+        A pool the factory does not name for a position that holds liquidity
+        is not "no pool": either the provider did not answer or the catalog
+        kind is wrong (a slipstream manager asked with the uint24 form reverts).
+        Both are worth a failed tick in `/health` rather than a position read
+        as closed.
+        """
         signature = ("getPool(address,address,int24)" if entry.kind == "slipstream"
                      else "getPool(address,address,uint24)")
         wanted = []
@@ -259,20 +282,19 @@ class UniV3Source:
                 wanted.append(key)
         # Asked only when there is a pool to resolve, which after the first
         # tick is usually none at all.
-        factory = await self._factory(chain, entry) if wanted else None
-        if wanted and factory:
+        if wanted:
+            factory = await self._factory(chain, entry)
+            _answered([factory], "factory()", where)
             answers = await self._adapter.eth_call_many(chain, [
                 (factory, selector(signature)
                  + f"{int(k[2], 16):064x}{int(k[3], 16):064x}{k[4]:064x}")
                 for k in wanted])
-            for key, answer in zip(wanted, answers):
-                found = decode_address(answer)
-                if found:
-                    self._pools[key] = found.lower()
-                else:
-                    log.warning("%s: no pool for %s", entry.label, key[2:])
+            found = [decode_address(a) for a in answers]
+            _answered(found, "getPool()", where)
+            for key, pool in zip(wanted, found):
+                self._pools[key] = pool.lower()
         for p in parsed:
-            p["pool"] = self._pools.get(p["pool_key"], "")
+            p["pool"] = self._pools[p["pool_key"]]
 
     async def _factory(self, chain: str, entry) -> str | None:
         """Which factory this position manager was deployed against.
@@ -298,18 +320,27 @@ class UniV3Source:
             self._factories[key] = found.lower()
         return self._factories[key]
 
-    async def _slots(self, chain: str, parsed: list[dict]) -> dict[str, tuple[int, int]]:
-        pools = sorted({p["pool"] for p in parsed if p["pool"]})
+    async def _slots(self, chain: str, parsed: list[dict],
+                     where: str) -> dict[str, tuple[int, int]]:
+        pools = sorted({p["pool"] for p in parsed})
         answers = await self._adapter.eth_call_many(
             chain, [(pool, selector("slot0()")) for pool in pools])
-        out = {}
-        for pool, answer in zip(pools, answers):
-            price = _word(answer, 0)
-            if price:
-                out[pool] = (price, _signed(_word(answer, 1)))
-        return out
+        # A pool with liquidity in it has a price; zero is as unanswered as None.
+        prices = [_word(a, 0) or None for a in answers]
+        _answered(prices, "slot0()", where)
+        return {pool: (price, _signed(_word(answer, 1)))
+                for pool, answer, price in zip(pools, answers, prices)}
 
-    async def _resolve_meta(self, chain: str, parsed: list[dict]) -> None:
+    async def _resolve_meta(self, chain: str, parsed: list[dict], where: str) -> None:
+        """Symbol and decimals, asked once per token and then remembered.
+
+        Only a full answer is remembered. The decimals are what every amount of
+        the leg is scaled by, in the digest and in the asset row the pipeline
+        creates on first sight and never updates - a default of 18 cached over
+        a missed call would misvalue a USDC leg by twelve orders of magnitude,
+        permanently. A symbol that will not decode (a bytes32 one) is cosmetic
+        and stays empty.
+        """
         wanted = []
         for p in parsed:
             for contract in (p["token0"], p["token1"]):
@@ -322,7 +353,8 @@ class UniV3Source:
             calls += [(contract, selector("symbol()")),
                       (contract, selector("decimals()"))]
         answers = await self._adapter.eth_call_many(chain, calls)
+        decimals = [decode_uint(answers[i * 2 + 1]) for i in range(len(wanted))]
+        _answered(decimals, "decimals()", where)
         for i, contract in enumerate(wanted):
             symbol = decode_string(answers[i * 2]) or ""
-            decimals = decode_uint(answers[i * 2 + 1])
-            self._meta[(chain, contract)] = (symbol, 18 if decimals is None else decimals)
+            self._meta[(chain, contract)] = (symbol, decimals[i])

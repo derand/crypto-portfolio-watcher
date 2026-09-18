@@ -2,6 +2,7 @@ import json
 import math
 
 import httpx
+import pytest
 
 import multicall
 from portfolio import catalog
@@ -9,6 +10,7 @@ from portfolio.chains.abi import encode_address, selector
 from portfolio.chains.base import Target
 from portfolio.chains.evm import MULTICALL3, EvmAdapter
 from portfolio.protocols import ticks
+from portfolio.retry import Unavailable
 from portfolio.protocols.univ3 import UniV3Source
 
 ME = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
@@ -261,18 +263,54 @@ async def test_the_factory_is_asked_once_and_only_when_a_pool_is_unknown():
         selector("getPool(address,address,uint24)"))]) == 1
 
 
-async def test_a_factory_that_could_not_be_read_is_not_remembered_as_none():
+async def test_a_factory_that_could_not_be_read_costs_the_tick_and_is_not_remembered():
     """One reverted read must not become the permanent answer: every position
-    this market gains afterwards would be unresolvable, and a position with no
-    pool is a position with no amount."""
+    this market gains afterwards would be unresolvable. Nor may it become an
+    empty answer for this tick - a position with no pool is a position with no
+    amount, and the pipeline would read that as the position having closed."""
     answers = market(-14377)
     hidden = answers.pop((NFPM, selector("factory()")))
     src, _ = source(answers, [UNI])
-    assert await src.fetch(target()) == ([], "")
+    with pytest.raises(Unavailable):
+        await src.fetch(target())
 
     answers[(NFPM, selector("factory()"))] = hidden
     positions, _ = await src.fetch(target())
     assert len(positions) == 2
+
+
+@pytest.mark.parametrize("call", ["balanceOf(address)", "positions(uint256)",
+                                  "slot0()", "decimals()"])
+async def test_a_question_about_a_held_position_that_goes_unanswered_costs_the_tick(call):
+    """A None from eth_call_many is a revert or a call the provider did not
+    serve, and for a position the owner demonstrably holds neither can be data.
+    Read as data it was a closed position: the stored row deleted, a terminal
+    zero written into the history, and a "closed" alert for each leg - over a
+    fault that cleared on the next tick."""
+    answers = market(-14377)
+    for key in [k for k in answers if k[1].startswith(selector(call))]:
+        answers.pop(key)
+    src, _ = source(answers, [UNI])
+    with pytest.raises(Unavailable) as e:
+        await src.fetch(target())
+    assert call.split("(")[0] in str(e.value)
+
+
+async def test_missing_decimals_are_not_remembered_as_eighteen():
+    """The decimals scale every amount of the leg, in the digest and in the
+    asset row the pipeline creates on first sight and never updates. A default
+    cached over one missed call would misvalue a USDC leg by twelve orders of
+    magnitude, permanently."""
+    answers = market(-14377)
+    hidden = answers.pop((USDC, selector("decimals()")))
+    src, _ = source(answers, [UNI])
+    with pytest.raises(Unavailable):
+        await src.fetch(target())
+
+    answers[(USDC, selector("decimals()"))] = hidden
+    positions, _ = await src.fetch(target())
+    usdc = [p for p in positions if p.symbol == "USDC"][0]
+    assert usdc.decimals == 6
 
 
 def crowded(ids, tick=-14377):

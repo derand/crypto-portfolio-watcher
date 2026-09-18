@@ -9,6 +9,7 @@ from portfolio.chains.base import Cursor, Target
 from portfolio.chains.evm import AGGREGATE_BATCH, MULTICALL3, EvmAdapter
 from portfolio.config import TokenCfg
 from portfolio.models import Direction
+from portfolio.retry import Unavailable
 
 ME = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
 THEM = "0x1111111111111111111111111111111111111111"
@@ -351,7 +352,7 @@ async def test_bad_api_key_is_permanent_not_retried():
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     a = EvmAdapter("nope", {}, client=client, url_template="http://{net}/{key}")
-    from portfolio.retry import Permanent
+    from portfolio.retry import Permanent, Unavailable
     with pytest.raises(Permanent, match="ALCHEMY_API_KEY"):
         await a.probe(target(), "ethereum", Cursor())
 
@@ -729,3 +730,39 @@ def test_repaying_a_debt_token_moves_the_balance_up():
     made = EvmAdapter._to_transfer(raw, "ethereum", Direction.OUT,
                                    {DEBT: DEBT_TOKENS["ethereum"][0]}, ME)
     assert made.effect == 500_000_000
+
+
+async def test_a_token_balance_the_provider_could_not_read_is_not_zero():
+    """A null with an error beside it used to become 0. After a real balance
+    that is an anomaly alert; on a yield-bearing token it is a silent negative
+    "vault yield" and a zeroed row that the next good tick books as a day's
+    earnings."""
+    broken = dict(BALANCES)
+    broken["alchemy_getTokenBalances"] = {"tokenBalances": [
+        {"contractAddress": USDC, "tokenBalance": None, "error": "unavailable"}]}
+    a, _ = adapter(broken)
+    with pytest.raises(Unavailable):
+        await a.probe(target(), "ethereum", Cursor())
+
+
+async def test_a_whitelisted_token_absent_from_the_answer_is_not_zero_either():
+    a, _ = adapter(dict(BALANCES, alchemy_getTokenBalances={"tokenBalances": []}))
+    with pytest.raises(Unavailable):
+        await a.probe(target(), "ethereum", Cursor())
+
+
+async def test_a_null_result_in_the_probe_batch_costs_the_tick():
+    """`_hex(None)` is 0, and a native balance of 0 after 1 ETH is money
+    leaving with no transfer to explain it."""
+    a, _ = adapter(dict(BALANCES, eth_getBalance=None))
+    with pytest.raises(Unavailable):
+        await a.probe(target(), "ethereum", Cursor())
+
+
+async def test_a_rate_call_that_answers_nothing_costs_the_tick():
+    """An empty answer is a rate of zero, and a rate of zero reports the shares
+    unscaled: the holding collapses on this tick and recovers on the next, as
+    two silent accruals."""
+    a, _ = adapter(dict(vault_answers(10**18, 0), eth_call="0x"), tokens=RATE_TOKENS)
+    with pytest.raises(Unavailable):
+        await a.probe(target(chains=("bsc",)), "bsc", Cursor())
