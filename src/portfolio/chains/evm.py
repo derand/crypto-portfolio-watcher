@@ -68,7 +68,7 @@ which a catalog sweep meets immediately, because it asks hundreds of questions
 back to back with no think time between them. Ten fits; the sweep is a manual
 command, so the extra round trips cost nobody anything."""
 CALL_PACE = 1.0                            # seconds between sweep batches
-RATE_MARKER_DP = 4                         # decimals of the rate the marker sees
+RATE_MARKER_DIGITS = 5                     # significant digits of the rate the marker sees
 
 
 def _rate_calldata(signature: str, decimals: int) -> str:
@@ -88,6 +88,21 @@ def _rate_calldata(signature: str, decimals: int) -> str:
     if signature.endswith("(uint256)"):
         data += f"{10 ** decimals:064x}"
     return data
+
+
+def _coarse_rate(rate: int) -> int:
+    """The rate cut to its leading digits, for the probe marker.
+
+    Cut by its own magnitude, not by the token's decimals: those say what the
+    *balance* is scaled by, and a rate is scaled by whatever its contract chose.
+    A 4626 vault's convertToAssets(1e18) is about 1e{decimals}, and four
+    decimals of it were five digits. A Compound-style exchangeRateStored() is
+    scaled by 1e(18 - 8 + underlying) - for a 6-decimal market divided by 100
+    it kept thirteen digits and moved every block. Five digits is the same
+    relative step for both: the rate has to move by a hundredth of a percent.
+    """
+    drop = 10 ** max(len(str(rate)) - RATE_MARKER_DIGITS, 0)
+    return rate // drop * drop
 
 
 def _server_fault(error) -> bool:
@@ -472,12 +487,11 @@ class EvmAdapter:
 
         parts = [str(native)] + [f"{k}={v}" for k, v in sorted(token_balances.items())]
         # The rate drifts every block. At full precision it would make every tick
-        # "changed" and turn the cheap probe into a transfer fetch; truncated to
-        # four decimals it moves a few times a day, which is often enough to keep
-        # the reported value honest.
+        # "changed" and turn the cheap probe into a transfer fetch; cut to five
+        # significant digits it moves a few times a day, which is often enough to
+        # keep the reported value honest.
         for tok in sorted(rate_tokens, key=lambda x: x.contract):
-            coarse = 10 ** max(tok.decimals - RATE_MARKER_DP, 0)
-            parts.append(f"{tok.contract}@{rates[tok.contract] // coarse}")
+            parts.append(f"{tok.contract}@{_coarse_rate(rates[tok.contract])}")
         marker = ":".join(parts)
         return Probe(changed=marker != cursor.last_marker, marker=marker,
                      raw={"tip": tip, "native": native, "tokens": token_balances,

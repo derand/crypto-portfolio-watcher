@@ -275,8 +275,10 @@ Beyond `chain`/`contract`/`symbol`/`decimals`:
   is its own group.
 
 The rate rides in the same JSON-RPC batch as the balances, so it costs no extra round trip.
-It is carried into the probe marker **truncated to four decimals**: at full precision it
-drifts every block and every tick would trigger the expensive path.
+It is carried into the probe marker **cut to five significant digits**: at full precision it
+drifts every block and every tick would trigger the expensive path. Digits of the rate itself,
+not decimals of the token - a rate is scaled by whatever its contract chose, and
+`exchangeRateStored()` is scaled by neither the share nor the asset.
 
 ## Testing
 

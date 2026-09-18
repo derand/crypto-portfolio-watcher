@@ -403,6 +403,40 @@ async def test_rate_drift_below_four_decimals_is_not_a_change():
     assert real.changed is True
 
 
+async def test_a_compound_style_rate_is_coarsened_by_its_own_scale():
+    """exchangeRateStored() is scaled by 1e(18 - 8 + underlying), not by the
+    token's decimals. Cut by the decimals, a 6-decimal market kept thirteen
+    digits of it, one block of interest changed the marker, and every tick paid
+    for a transfer fetch and a snapshot row per asset - for as long as the
+    token stayed whitelisted."""
+    ctoken = "0x5c0a7e11d2b3c4d5e6f708192a3b4c5d6e7f8091"
+    tokens = {"ethereum": [TokenCfg(
+        chain="ethereum", contract=ctoken, symbol="cUSDC", decimals=6,
+        share_decimals=18, coingecko_id="usd-coin",
+        rate_call="exchangeRateStored()")]}
+    t = target(chains=("ethereum",))
+
+    def answers(rate):
+        return {"eth_blockNumber": "0x100", "eth_getBalance": "0x0",
+                "alchemy_getTokenBalances": {"tokenBalances": [
+                    {"contractAddress": ctoken, "tokenBalance": hex(5000 * 10**8)}]},
+                "eth_call": hex(rate)}
+
+    a, _ = adapter(answers(227123456780000), tokens=tokens)
+    first = await a.probe(t, "ethereum", Cursor())
+    state = await a.fetch(t, "ethereum", Cursor(), first)
+    held = [b for b in state.balances if b.asset_key == f"ethereum:{ctoken}"]
+    assert held[0].amount_raw == 113561728        # 5000 cUSDC = 113.561728 USDC
+
+    b, _ = adapter(answers(227123466780000), tokens=tokens)     # one block of interest
+    nudged = await b.probe(t, "ethereum", Cursor(last_marker=first.marker))
+    assert nudged.changed is False
+
+    c, _ = adapter(answers(227150000000000), tokens=tokens)     # a hundredth of a percent
+    real = await c.probe(t, "ethereum", Cursor(last_marker=first.marker))
+    assert real.changed is True
+
+
 async def test_rebasing_token_without_a_rate_call_is_still_yield_bearing():
     """An Aave aToken grows with no rate to read; the flag is what stops it
     reading as money from nowhere."""
