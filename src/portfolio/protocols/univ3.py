@@ -11,7 +11,7 @@ Three things about this shape drive the design here:
 
   * **The composition drifts with the price, with no transfer behind it.** Left
     unhandled that is an anomaly every tick, forever, so both legs are marked
-    `accrues`. The marker leaves the price out for the same reason - see MARKER.
+    `drifts`: silent, and not yield either. The marker leaves the price out for the same reason - see MARKER.
   * **Uncollected fees are not in the NFT.** `tokensOwed0/1` only move when the
     position is poked, so on a position untouched for years they read zero while
     real fees sit there. The honest reading is to simulate `collect()` with
@@ -251,8 +251,9 @@ class UniV3Source:
                     asset_key=f"{chain}:{contract}",
                     # The split between the two tokens moves with every trade in
                     # the pool. That is not income and not a transfer; alerting
-                    # on it would fire for as long as the position is open.
-                    accrues=True,
+                    # on it would fire for as long as the position is open, and
+                    # summing it as yield counts one leg and drops the other.
+                    drifts=True,
                     extra={"venue": entry.protocol, "token_id": str(p["id"]),
                            "pool": p["pool"], "tick": str(tick),
                            "tick_lower": str(p["lower"]),

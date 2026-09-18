@@ -100,7 +100,7 @@ per second and the run dies on 429.
 are not interchangeable, so there is no fungible LP token to whitelist — the NFT stores a
 liquidity coefficient and two tick bounds, and what it *holds* is computed from the pool's
 current price (`protocols/ticks.py`, integer-exact, ported from TickMath). Three consequences
-worth keeping: the composition drifts with every trade, so both legs are `accrues` and the
+worth keeping: the composition drifts with every trade, so both legs are `drifts` and the
 probe marker carries the tick **bucketed to 60** rather than the amounts; uncollected fees
 are not in the NFT at all (`tokensOwed` only moves when the position is poked, so it reads
 zero on an untouched position) and are read by simulating `collect()` — which only answers
@@ -225,7 +225,8 @@ promise as money. Beacon validators are on-chain — the ETH is staked, not depo
 | balance grows on its own (Aave rebase, vault share) | `BalanceSnapshot.yield_bearing` | residual → `accrual`, silent |
 | a debt grows on its own (borrow interest) | `BalanceSnapshot.debt`, residual under the threshold | `accrual`, silent |
 | a debt jumps (borrow or repayment) | `BalanceSnapshot.debt`, residual over the threshold | `position_change` → alerts |
-| position grows on its own (validator, HL account) | `Position.accrues` | change → `accrual`, silent |
+| position grows on its own (validator) | `Position.accrues` | change → `accrual`, silent |
+| position moves on its own, not income (LP legs, HL account) | `Position.drifts` | no event; `position_snapshots` only |
 | money appears with nothing to explain it | neither flag | `anomaly` → alerts |
 
 The USD threshold (`thresholds.notify_usd`) applies to **transfers and position changes
@@ -237,7 +238,9 @@ the consequence of not knowing what something is worth.
 
 `events.kind` decides the channel: `transfer` and `position_change` alert, `accrual` only
 reaches the daily digest, aggregated per asset — the vaults accrue every tick, and a day of
-raw accrual rows is thirty lines saying nothing. When a real holding starts alerting every few hours, the answer
+raw accrual rows is thirty lines saying nothing. The digest prints accruals as *yield*, so only
+income may become one: an LP's legs trading against each other, or unrealised PnL, summed there
+read as money earned (PLAN §10.4). When a real holding starts alerting every few hours, the answer
 is almost always a missing flag rather than a threshold.
 
 ## Whitelist mechanics (`TokenCfg`)

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from portfolio import config as cfgmod
 from portfolio import db as dbmod
+from portfolio import digest
 from portfolio import pipeline
 from portfolio.chains.base import AddressState, Cursor, Target
 from portfolio.models import (BalanceSnapshot, Direction, Position, Probe,
@@ -540,7 +541,7 @@ def spot(coin="USDC", amount=4782113549):
 def account(value=100000000000):
     return Position(protocol="hyperliquid", key="account", symbol="USD",
                     amount_raw=value, decimals=8, asset_key="hyperliquid:account",
-                    usd=1000.0, extra={"withdrawable": "900.0"})
+                    usd=1000.0, drifts=True, extra={"withdrawable": "900.0"})
 
 
 async def run_hl(cfg, conn, router, src):
@@ -593,8 +594,10 @@ async def test_resizing_and_closing_a_position_each_alert_once(tmp_path):
                         ).fetchone()[0] == 0
 
 
-async def test_account_value_drift_never_alerts(tmp_path):
-    """Unrealised PnL moves the account value constantly; it is digest material."""
+async def test_account_value_drift_never_alerts_and_is_not_yield(tmp_path):
+    """Unrealised PnL moves the account value constantly. Alerting on it fires
+    every tick; recording it as an accrual put a paper gain in the digest's
+    yield table, which is worse, because nothing there looks wrong."""
     cfg, conn = setup_hl(tmp_path)
     src = FakeSource([[account(100000000000), spot()],
                       [account(123456789000), spot(amount=5000000000)]])
@@ -602,7 +605,7 @@ async def test_account_value_drift_never_alerts(tmp_path):
     await run_hl(cfg, conn, router, src)
     await run_hl(cfg, conn, router, src)
     kinds = sorted(r["kind"] for r in conn.execute("SELECT kind FROM events"))
-    assert kinds == ["accrual", "position_change"]
+    assert kinds == ["position_change"]
     assert "spot:USDC" in router.sent[0].body
     assert "account" not in router.sent[0].body
 
@@ -1176,7 +1179,7 @@ class FakeRangeSource:
         p = Position(
             protocol="univ3", key="ethereum:4242:0", symbol="WETH",
             amount_raw=10 ** 18, decimals=18, asset_key="ethereum:native",
-            accrues=True,
+            drifts=True,
             extra={"venue": "uniswap-v3", "token_id": "4242", "tick": "-14377",
                    "in_range": state})
         return [p], f"{state}:{self.i}"
@@ -1261,26 +1264,69 @@ async def test_leaving_the_range_twice_is_said_twice(tmp_path):
         (True, False), (False, True), (True, False)]
 
 
-async def test_the_drifting_amount_of_a_range_position_stays_silent(tmp_path):
+async def test_a_drifting_range_position_is_neither_an_alert_nor_yield(tmp_path):
     """Its composition changes with every trade in the pool, with no transfer
-    behind it. That is digest material; alerting on it fires for as long as the
-    position exists."""
+    behind it. Alerting on that fires for as long as the position exists; and
+    recorded as an accrual it reached the digest as yield - the growing leg
+    summed as earnings, the shrinking one dropped, so a day that netted about
+    zero read "ETH 0.5 univ3 $1,500.00". The quantities are still kept, in
+    position_snapshots, which is where a history of them belongs."""
     cfg, conn = setup_univ3(tmp_path)
     router = FakeRouter()
 
     class Drifting(FakeRangeSource):
         async def fetch(self, t):
             positions, _ = await super().fetch(t)
-            positions[0].amount_raw = 10 ** 18 + self.i * 10 ** 15
-            return positions, f"drift:{self.i}"
+            n = self.i
+            positions[0].amount_raw = 10 ** 18 + n * 5 * 10 ** 17
+            positions.append(Position(
+                protocol="univ3", key="ethereum:4242:1", symbol="USDC",
+                amount_raw=(3000 - n * 1500) * 10**6, decimals=6,
+                asset_key="ethereum:usdc", drifts=True,
+                extra={"venue": "uniswap-v3", "token_id": "4242",
+                       "in_range": "true"}))
+            return positions, f"drift:{n}"
 
-    src = Drifting(["true", "true", "true"])
-    for _ in range(3):
+    src = Drifting(["true", "true"])
+    prices = FakePrices({"ethereum:native": 3000.0, "ethereum:usdc": 1.0})
+    for _ in range(2):
+        await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src}, prices=prices)
+
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert router.sent == []
+    history = conn.execute(
+        "SELECT COUNT(DISTINCT amount_raw) FROM position_snapshots "
+        "WHERE position_key='ethereum:4242:1'").fetchone()[0]
+    assert history == 2, "the drift is still recorded as quantities"
+    summary, detail = digest._last24h(digest.collect(conn)["recent"])
+    assert "yield" not in summary
+    assert detail == []
+
+
+async def test_a_position_that_earns_is_still_yield(tmp_path):
+    """The other half of the split: a validator's balance, which only grows,
+    must still reach the digest - a yield line that never appears reads as a
+    broken watcher."""
+    cfg, conn = setup_univ3(tmp_path)
+    router = FakeRouter()
+
+    class Earning(FakeRangeSource):
+        async def fetch(self, t):
+            positions, _ = await super().fetch(t)
+            positions[0].drifts = False
+            positions[0].accrues = True
+            positions[0].amount_raw = 32 * 10**18 + self.i * 10**15
+            return positions, f"earn:{self.i}"
+
+    src = Earning(["true", "true"])
+    for _ in range(2):
         await pipeline.scan_once(cfg, conn, router, {}, {"univ3": src})
 
-    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events")]
-    assert kinds and set(kinds) == {"accrual"}
+    rows = conn.execute("SELECT kind, amount_raw FROM events").fetchall()
+    assert [(r["kind"], r["amount_raw"]) for r in rows] == [("accrual", str(10**15))]
     assert router.sent == []
+    summary, _ = digest._last24h(digest.collect(conn)["recent"])
+    assert "yield in 1 asset" in summary
 
 
 async def test_daily_claim_reminder_prices_both_lp_fee_legs(tmp_path):
@@ -1293,7 +1339,7 @@ async def test_daily_claim_reminder_prices_both_lp_fee_legs(tmp_path):
             positions, marker = await super().fetch(t)
             positions.append(Position(
                 protocol="univ3", key="ethereum:4242:1", symbol="USDC",
-                amount_raw=10**6, decimals=6, asset_key="ethereum:usdc", accrues=True,
+                amount_raw=10**6, decimals=6, asset_key="ethereum:usdc", drifts=True,
                 extra={"venue": "uniswap-v3", "token_id": "4242", "in_range": "true"}))
             return positions, marker
 
@@ -1332,7 +1378,7 @@ async def test_an_unpriced_fee_leg_never_hides_the_priced_one(tmp_path):
             positions.append(Position(
                 protocol="univ3", key="ethereum:4242:1", symbol="NEWCOIN",
                 amount_raw=7 * 10**18, decimals=18, asset_key="ethereum:newcoin",
-                accrues=True,
+                drifts=True,
                 extra={"venue": "uniswap-v3", "token_id": "4242", "in_range": "true"}))
             return positions, marker
 

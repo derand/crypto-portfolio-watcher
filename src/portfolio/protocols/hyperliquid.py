@@ -144,6 +144,9 @@ class HyperliquidSource:
             protocol="hyperliquid", key="account", symbol="USD",
             amount_raw=_scaled(value), decimals=SCALE,
             asset_key="hyperliquid:account", usd=float(value),
+            # Margin plus unrealised PnL: it moves every second, and none of
+            # that movement is income. The perp lines already say what is open.
+            drifts=True,
             extra={"withdrawable": str(state.get("withdrawable", "0")),
                    "margin_used": str(summary.get("totalMarginUsed", "0")),
                    "position_value": str(summary.get("totalNtlPos", "0"))})]

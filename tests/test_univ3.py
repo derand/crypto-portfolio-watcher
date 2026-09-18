@@ -208,8 +208,8 @@ async def test_one_nft_becomes_two_legs_that_can_be_priced():
     assert [p.decimals for p in positions] == [18, 6]
     assert positions[0].asset_key == f"ethereum:{WETH}"
     assert all(p.amount_raw > 0 for p in positions), "in range: both legs held"
-    assert all(p.accrues for p in positions), \
-        "composition moves with every trade; alerting on it never stops"
+    assert all(p.drifts and not p.accrues for p in positions), \
+        "composition moves with every trade: never an alert, and never yield"
 
 
 async def test_the_held_ids_come_from_the_index_not_one_call_per_position():

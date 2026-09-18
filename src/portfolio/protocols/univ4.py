@@ -224,7 +224,7 @@ class UniV4Source:
                     amount_raw=amount,
                     decimals=18 if native else decimals,
                     asset_key=(f"{chain}:native" if native else f"{chain}:{contract}"),
-                    accrues=True,
+                    drifts=True,
                     extra={"venue": entry.protocol, "token_id": str(p["id"]),
                            "pool": "0x" + p["pid"].hex(), "hooks": p["hooks"],
                            "tick": str(tick), "tick_lower": str(p["lower"]),

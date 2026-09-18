@@ -150,6 +150,13 @@ class Position:
     """True when this position's amount climbs on its own - a validator earning
     attestation rewards. Such a change is yield: it belongs in the digest, and
     alerting on it would fire every epoch forever."""
+    drifts: bool = False
+    """True when the amount moves on its own but the movement is not income: a
+    range position's two legs trading against each other, an exchange account's
+    equity riding unrealised PnL. Silent like `accrues`, and recorded nowhere
+    but `position_snapshots` - summed as an accrual it read, in the digest, as
+    yield: the growing leg of an LP counted as earnings, the shrinking one
+    dropped, and a position that netted zero reported $1,500 made."""
     extra: dict[str, Any] = field(default_factory=dict)
 
 

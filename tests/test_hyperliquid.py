@@ -138,6 +138,16 @@ async def test_account_summary_is_always_present():
     assert acct.amount_raw == 4984935975654099
 
 
+async def test_account_value_drifts_rather_than_accrues():
+    """Margin plus unrealised PnL. Marked as yield it reached the digest as
+    "USD 420 hyperliquid $420.00" under "yield" - a paper gain presented as
+    income, beside a "closed, pnl" figure that is the realised one."""
+    s, _ = source(perp_state(account="1000"), spot_state())
+    positions, _ = await s.fetch(TARGET)
+    acct = [p for p in positions if p.key == "account"][0]
+    assert acct.drifts and not acct.accrues
+
+
 async def test_staking_buckets_are_separate_positions():
     """Delegated, idle and queued-for-withdrawal are three different states of
     the same coin, and only the non-zero ones are reported."""

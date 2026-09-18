@@ -795,7 +795,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
             asset_id = (_asset_id(conn, p.asset_key, p.symbol, p.decimals,
                                   getattr(p, "contract", ""))
                         if p.asset_key else None)
-            # Before the accrues shortcut below: a position whose amount is
+            # Before the silent shortcut below: a position whose amount is
             # deliberately silent can still have crossed a line.
             eid = _state_event(conn, cfg, chain, address_id, p, prev)
             if eid:
@@ -804,13 +804,16 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
 
             _upsert_position(conn, address_id, p, asset_id)
 
-            if p.key == "account" or p.accrues:
-                # Account value moves with unrealised PnL, a validator balance
-                # with every epoch. Digest material, not an alert - otherwise an
-                # open position notifies forever.
-                if before is not None and before != p.amount_raw and not baseline:
-                    detail = ("hyperliquid account value" if p.key == "account"
-                              else f"{p.protocol} {p.key}")
+            if p.accrues or p.drifts:
+                # A validator balance moves with every epoch, an LP's legs with
+                # every trade, an account value with unrealised PnL - none of it
+                # an alert, or an open position notifies forever. Only the first
+                # is yield, and only yield is recorded: the digest sums accruals
+                # as earnings, and drift summed that way is a number that looks
+                # like income and is not. `position_snapshots` keeps the rest.
+                if (p.accrues and before is not None and before != p.amount_raw
+                        and not baseline):
+                    detail = f"{p.protocol} {p.key}"
                     moved = p.amount_raw - before
                     # A position without an asset_key has nothing to price it
                     # by: "staking:pending" is a bucket, not a coin.
@@ -1061,8 +1064,9 @@ def _state_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
     """An alert about a position's *state* rather than its size.
 
     Separate from the amount diff, and reached even for positions marked
-    `accrues`, because the two answer different questions. A perp's value moves
-    every second and a range position's composition moves with every trade -
+    `accrues` or `drifts`, because the two answer different questions. A
+    perp's value moves every second and a range position's composition moves
+    with every trade -
     both are noise - yet each can cross a line that is worth exactly one
     message: liquidation coming close, liquidity falling out of range.
     """

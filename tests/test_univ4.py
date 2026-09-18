@@ -232,7 +232,8 @@ async def test_the_range_alert_works_the_same_as_it_does_for_v3():
     assert got_in[0].extra["in_range"] == "true"
     assert got_out[0].extra["in_range"] == "false"
     assert marker_in != marker_out
-    assert all(p.accrues for p in got_in), "composition drift stays silent"
+    assert all(p.drifts and not p.accrues for p in got_in), \
+        "composition drift stays silent, and is not yield"
 
 
 async def test_a_price_nudge_does_not_move_the_marker():
