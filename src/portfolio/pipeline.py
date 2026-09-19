@@ -110,6 +110,36 @@ def _mark_failure(conn, chain: str, address_id: int, scope: str = "") -> int:
         (chain, address_id, scope)).fetchone()["fail_count"]
 
 
+def _fail(conn, res, chain: str, address_id: int, scope: str, where: str,
+          e: Exception, unexpected: bool = True) -> None:
+    """Record one scope as failed and let the tick go on.
+
+    Whatever went wrong, it is this scope's problem, not the tick's: an
+    exception let out of a scope skips every address after it *and*
+    `_deliver()`, so one bad network - or one stored row that no longer parses -
+    holds back the alerts for all of them, on every tick, until somebody fixes
+    it by hand. The cursor is left where it was, so the scope is simply tried
+    again next tick.
+    """
+    conn.execute("BEGIN")
+    fails = _mark_failure(conn, chain, address_id, scope)
+    conn.execute("COMMIT")
+    if unexpected:
+        log.exception("%s: unexpected failure (consecutive: %d)", where, fails)
+    else:
+        log.error("%s: %s (consecutive failures: %d)", where, e, fails)
+    res.failed.append(f"{where}: {e}")
+
+
+def _counts(res) -> tuple[int, int, int]:
+    return res.new_events, res.confirmed, res.below_threshold
+
+
+def _restore_counts(res, counts: tuple[int, int, int]) -> None:
+    """A rolled-back write recorded nothing, so it must not report anything."""
+    res.new_events, res.confirmed, res.below_threshold = counts
+
+
 def _record_transfer(conn, chain: str, scope: str, address_id: int,
                      asset_id: int, t, own: set[str], usd: float | None = None) -> str:
     """Insert or update one transfer. Returns 'new' | 'confirmed' | 'unchanged'.
@@ -409,29 +439,19 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
         res.changed += 1
         state = await adapter.fetch(target, scope, cursor, probe)
     except Unavailable as e:
-        conn.execute("BEGIN")
-        fails = _mark_failure(conn, chain, address_id, scope)
-        conn.execute("COMMIT")
-        log.error("%s: %s (consecutive failures: %d)", where, e, fails)
-        res.failed.append(f"{where}: {e}")
+        _fail(conn, res, chain, address_id, scope, where, e, unexpected=False)
         return
     except Exception as e:                           # noqa: BLE001
         # Anything else a provider can raise: a Permanent (Alchemy answers 403
         # for a network merely disabled in the dashboard) or a shape change
-        # that comes out as KeyError. It is this scope's problem, not the
-        # tick's - letting it out skips every address after this one *and*
-        # _deliver(), so one bad network holds back the alerts for all of them,
-        # on every tick, for as long as the provider stays broken.
-        conn.execute("BEGIN")
-        fails = _mark_failure(conn, chain, address_id, scope)
-        conn.execute("COMMIT")
-        log.exception("%s: unexpected failure (consecutive: %d)", where, fails)
-        res.failed.append(f"{where}: {e}")
+        # that comes out as KeyError. _fail says why it must not escape.
+        _fail(conn, res, chain, address_id, scope, where, e)
         return
 
+    counts = _counts(res)
+    baseline = cursor.is_fresh
     conn.execute("BEGIN")
     try:
-        baseline = cursor.is_fresh
         explained: dict[str, int] = {}
         for t in state.transfers:
             aid = _asset_id(conn, t.asset_key, t.symbol, t.decimals)
@@ -503,9 +523,14 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
 
         _save_cursor(conn, chain, address_id, state.cursor, scope)
         conn.execute("COMMIT")
-    except Exception:
+    except Exception as e:                           # noqa: BLE001
+        # The write half fails the same way the fetch half does: a stored
+        # amount that no longer parses, an IntegrityError. The rollback leaves
+        # the cursor where it was, so nothing is lost by carrying on.
         conn.execute("ROLLBACK")
-        raise
+        _restore_counts(res, counts)
+        _fail(conn, res, chain, address_id, scope, where, e)
+        return
 
     if baseline:
         log.info("%s: baseline recorded, watching from now", where)
@@ -746,27 +771,19 @@ def _position_event(conn, chain: str, address_id: int, uid: str, detail: str,
 async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                           prices=None) -> None:
     chain = source.name
+    where = f"{target.label}/{chain}"
     res.probed += 1
     cursor = _load_cursor(conn, chain, address_id)
 
     try:
         positions, marker = await source.fetch(target)
     except Unavailable as e:
-        conn.execute("BEGIN")
-        fails = _mark_failure(conn, chain, address_id)
-        conn.execute("COMMIT")
-        log.error("%s/%s: %s (consecutive failures: %d)", target.label, chain, e, fails)
-        res.failed.append(f"{target.label}/{chain}: {e}")
+        _fail(conn, res, chain, address_id, "", where, e, unexpected=False)
         return
     except Exception as e:                           # noqa: BLE001
         # Same reasoning as _scan_scope: one broken source must not cost the
         # delivery of what every other source already found.
-        conn.execute("BEGIN")
-        fails = _mark_failure(conn, chain, address_id)
-        conn.execute("COMMIT")
-        log.exception("%s/%s: unexpected failure (consecutive: %d)",
-                      target.label, chain, fails)
-        res.failed.append(f"{target.label}/{chain}: {e}")
+        _fail(conn, res, chain, address_id, "", where, e)
         return
 
     if marker == cursor.last_marker:
@@ -777,19 +794,25 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
     res.changed += 1
     baseline = cursor.is_fresh
 
-    previous = {r["position_key"]: r for r in conn.execute(
-        """SELECT p.position_key, p.amount_raw, p.extra, p.asset_id, s.decimals,
-                  s.symbol, s.asset_key
-             FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
-            WHERE p.address_id=? AND p.protocol=?""",
-        (address_id, source.name))}
-    # Deliberately outside the transaction below: this asks the venue over the
-    # network, and a transaction held open across a request is a lock held for
-    # as long as the provider feels like taking.
-    trades = ({} if baseline else
-              await _closed_trades(conn, source, target, chain, address_id,
-                                   previous, positions))
+    try:
+        previous = {r["position_key"]: r for r in conn.execute(
+            """SELECT p.position_key, p.amount_raw, p.extra, p.asset_id, s.decimals,
+                      s.symbol, s.asset_key
+                 FROM positions p LEFT JOIN assets s ON s.id = p.asset_id
+                WHERE p.address_id=? AND p.protocol=?""",
+            (address_id, source.name))}
+        # Deliberately outside the transaction below: this asks the venue over
+        # the network, and a transaction held open across a request is a lock
+        # held for as long as the provider feels like taking. It still reads the
+        # stored amounts, so it fails the scope the way the write does.
+        trades = ({} if baseline else
+                  await _closed_trades(conn, source, target, chain, address_id,
+                                       previous, positions))
+    except Exception as e:                           # noqa: BLE001
+        _fail(conn, res, chain, address_id, "", where, e)
+        return
 
+    counts = _counts(res)
     conn.execute("BEGIN")
     try:
         seen = set()
@@ -893,12 +916,16 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
 
         _save_cursor(conn, chain, address_id, Cursor(last_marker=marker, last_item=marker))
         conn.execute("COMMIT")
-    except Exception:
+    except Exception as e:                           # noqa: BLE001
+        # As in _scan_scope: the rollback keeps the old marker, so the same
+        # change is looked at again next tick rather than lost.
         conn.execute("ROLLBACK")
-        raise
+        _restore_counts(res, counts)
+        _fail(conn, res, chain, address_id, "", where, e)
+        return
 
     if baseline:
-        log.info("%s/%s: baseline recorded, watching from now", target.label, chain)
+        log.info("%s: baseline recorded, watching from now", where)
 
 
 def _usd_of(prices, asset_key: str, amount_raw: int, decimals: int) -> float | None:

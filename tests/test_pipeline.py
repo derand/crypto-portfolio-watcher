@@ -1618,3 +1618,73 @@ async def test_a_closed_position_ends_its_history_at_zero(tmp_path):
     assert await _history(conn, "perp:ETH") == ["150000000", "0"]
     assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='perp:ETH'"
                         ).fetchone()[0] == 0
+
+
+async def test_a_stored_row_that_does_not_parse_fails_its_scope_and_not_the_tick(tmp_path):
+    """The fetch half of a scope has always caught everything; the write half
+    rolled back and re-raised. A balance row that no longer parses then escaped
+    scan_once on every tick: every address after it went unscanned and
+    _deliver() never ran, so one bad row silenced the whole watcher until
+    somebody fixed it by hand - with nothing in the chat to say why."""
+    cfg, conn = setup(tmp_path)
+    chain = FakeChain({A1: [(100_000, []), (150_000, [transfer("0xa", 50_000)])],
+                       A2: [(0, []), (50_000, [transfer("0xb", 50_000)])]})
+    router = FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})       # baseline
+    a1 = conn.execute("SELECT id FROM addresses WHERE address=?", (A1,)).fetchone()["id"]
+    marker = conn.execute("SELECT last_marker FROM cursors WHERE address_id=?",
+                          (a1,)).fetchone()["last_marker"]
+    conn.execute("UPDATE balances SET amount_raw='garbage' WHERE address_id=?", (a1,))
+
+    res = await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+
+    assert len(router.sent) == 1, "the healthy address still reaches the chat"
+    assert any("btc-1" in f for f in res.failed), "and the broken one is reported"
+    assert res.new_events == 1, "a rolled-back transfer must not be counted as news"
+    assert [r["tx_hash"] for r in events(conn)] == ["0xb"], \
+        "nothing of the failed scope is half-written"
+    row = conn.execute("SELECT last_marker, fail_count FROM cursors WHERE address_id=?",
+                       (a1,)).fetchone()
+    assert row["last_marker"] == marker, "the cursor stays, so next tick tries again"
+    assert row["fail_count"] == 1
+
+
+async def test_a_position_write_that_fails_records_nothing_and_says_so(tmp_path):
+    """Same rule on the position path. The ETH row cannot be read back, so the
+    tick fails half-way through the diff - after BTC's open was already
+    recorded. That open must go with the rollback, or it is announced now and
+    announced again when the scope next succeeds."""
+    cfg, conn = setup_hl(tmp_path)
+    src = FakeSource([[account(), perp("ETH")],
+                      [account(), perp("BTC", size=1000000), perp("ETH", size=200000000)]])
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)                                  # baseline
+    marker = conn.execute("SELECT last_marker FROM cursors").fetchone()["last_marker"]
+    conn.execute("UPDATE positions SET amount_raw='garbage' WHERE position_key='perp:ETH'")
+
+    res = await run_hl(cfg, conn, router, src)
+
+    assert res.failed and "hl-1/hyperliquid" in res.failed[0]
+    assert res.new_events == 0
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert router.sent == []
+    row = conn.execute("SELECT last_marker, fail_count FROM cursors").fetchone()
+    assert row["last_marker"] == marker and row["fail_count"] == 1
+
+
+async def test_a_venue_asked_about_closes_cannot_escape_the_tick_either(tmp_path):
+    """`_closed_trades` reads the stored sizes before the transaction opens, to
+    decide whether the venue is worth a request. It sat outside every handler,
+    so for a venue that can report trades the same unreadable row escaped the
+    tick from there instead."""
+    cfg, conn = setup_hl(tmp_path)
+    src = TradingSource([[account(), perp("ETH")], [account()]])
+    router = FakeRouter()
+    await run_hl(cfg, conn, router, src)                                  # baseline
+    conn.execute("UPDATE positions SET amount_raw='garbage' WHERE position_key='perp:ETH'")
+
+    res = await run_hl(cfg, conn, router, src)
+
+    assert res.failed and "hl-1/hyperliquid" in res.failed[0]
+    assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='perp:ETH'"
+                        ).fetchone()[0] == 1, "nothing closed on the strength of a bad read"

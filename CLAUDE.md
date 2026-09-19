@@ -206,7 +206,9 @@ loses nothing; the next tick delivers what is still pending. Delivery happens on
 end of the tick, which is why a failure inside one scope must never escape it: an
 exception out of `_scan_scope` or `_scan_positions` skips every remaining address *and*
 `_deliver()`, so one provider answering 403 holds back alerts for addresses it has nothing
-to do with. Both catch broadly and record the scope as failed. The daily digest is the
+to do with. Both catch broadly and record the scope as failed (`_fail`) - around the fetch
+*and* around the write: a stored row that no longer parses is the same kind of failure, and
+the rollback leaves the cursor where it was, so the scope is simply tried again next tick. The daily digest is the
 same idea in reverse: its baseline is written only when a channel actually accepted it, so
 an outage at 9am retries instead of silently losing the day.
 
