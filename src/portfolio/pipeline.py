@@ -64,8 +64,14 @@ def _asset_id(conn, asset_key: str, symbol: str, decimals: int,
 
 
 def priceable_assets(conn) -> list[dict]:
+    """What something reads a price for: the whitelist, and whatever a position
+    points at. An LP leg is registered as an erc20 and `init-db` clears its
+    flag, yet the position is valued through it; a token dropped from the YAML
+    is read by nothing, and pricing it anyway costs a request a refresh."""
     return [dict(r) for r in conn.execute(
-        "SELECT asset_key, chain, contract, symbol, coingecko_id FROM assets")]
+        """SELECT asset_key, chain, contract, symbol, coingecko_id FROM assets
+            WHERE whitelisted = 1
+               OR id IN (SELECT asset_id FROM positions WHERE asset_id IS NOT NULL)""")]
 
 
 def _load_cursor(conn, chain: str, address_id: int, scope: str = "") -> Cursor:

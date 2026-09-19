@@ -18,16 +18,28 @@ __all__ = ["PriceBook", "PriceSources", "build_prices"]
 def build_prices(cfg, conn):
     return PriceBook(conn, PriceSources(cfg.api_keys.coingecko),
                      ttl_minutes=cfg.prices.ttl_minutes,
-                     max_age_minutes=cfg.prices.max_age_minutes)
+                     max_age_minutes=cfg.prices.max_age_minutes,
+                     miss_ttl_minutes=cfg.prices.miss_ttl_minutes)
 
 
 class PriceBook:
     def __init__(self, conn, sources: PriceSources, ttl_minutes: int = 15,
-                 max_age_minutes: int = 180):
+                 max_age_minutes: int = 180, miss_ttl_minutes: int = 60):
         self._conn = conn
         self._sources = sources
         self._ttl = timedelta(minutes=ttl_minutes)
         self._max_age = timedelta(minutes=max_age_minutes)
+        self._miss_ttl = timedelta(minutes=miss_ttl_minutes)
+        self._missed: dict[str, datetime] = {}
+        """When each asset was last asked about and every source answered
+        without a price.
+
+        Without it an asset nobody lists never becomes fresh, so it is asked
+        again on every refresh - one DexScreener request each, every fifteen
+        minutes and on every tap of Refresh, forever. Only an answer counts: a
+        source that raised said nothing about the asset, and it is asked again
+        next time. In memory on purpose - the cost is the long-lived `watch`,
+        and a one-shot command asking once is the price of not storing it."""
         self._cache: dict[str, float] = {}
         """Only what is currently young enough to quote.
 
@@ -84,11 +96,14 @@ class PriceBook:
         """
         ttl = self._ttl if ttl_minutes is None else timedelta(minutes=ttl_minutes)
         fresh = self._reload(ttl)
-        stale = [a for a in assets if a["asset_key"] not in fresh]
+        now = datetime.now(timezone.utc)
+        resting = {k for k, ts in self._missed.items() if now - ts < self._miss_ttl}
+        stale = [a for a in assets if a["asset_key"] not in fresh | resting]
         if not stale:
             return
 
         found: dict[str, float] = {}
+        missed: set[str] = set()
         native_ids: dict[str, list[str]] = {}
         tokens: dict[str, list[str]] = {}
         hyperliquid: list[dict] = []
@@ -117,15 +132,18 @@ class PriceBook:
                 for coin_id, keys in native_ids.items():
                     if coin_id in prices:
                         found.update({k: prices[coin_id] for k in keys})
+                    else:
+                        missed.update(keys)
             except Exception as e:                       # noqa: BLE001
                 log.warning("native prices unavailable: %s", e)
 
         for chain, contracts in tokens.items():
             try:
                 prices = await self._sources.coingecko_tokens(chain, contracts)
+                listed_answered = True
             except Exception as e:                       # noqa: BLE001
                 log.warning("token prices unavailable on %s: %s", chain, e)
-                prices = {}
+                prices, listed_answered = {}, False
             for contract in contracts:
                 key = f"{chain}:{contract}"
                 if contract in prices:
@@ -134,20 +152,24 @@ class PriceBook:
                 try:
                     # Long tail: CoinGecko lists a fraction of what exists.
                     price = await self._sources.dexscreener(chain, contract)
+                    answered = listed_answered
                 except Exception as e:                   # noqa: BLE001
                     log.warning("dexscreener failed for %s: %s", key, e)
-                    price = None
+                    price, answered = None, False
                 if price is not None:
                     found[key] = price
                 else:
                     log.info("no price for %s; it stays unpriced, not zero", key)
+                    if answered:
+                        missed.add(key)
 
         if hyperliquid:
-            mids = {}
+            mids, answered = {}, True
             try:
                 mids = await self._sources.hyperliquid_mids()
             except Exception as e:                       # noqa: BLE001
                 log.warning("hyperliquid mids unavailable: %s", e)
+                answered = False
             spot = {}
             # Only fetch the spot book when something needs it: perps, staked
             # HYPE and USDC are all answered by allMids alone.
@@ -157,6 +179,7 @@ class PriceBook:
                     spot = await self._sources.hyperliquid_spot_mids()
                 except Exception as e:                   # noqa: BLE001
                     log.warning("hyperliquid spot mids unavailable: %s", e)
+                    answered = False
             for a in hyperliquid:
                 symbol = a["symbol"]
                 # Only a numeric contract is a spot token index. Rows written
@@ -177,7 +200,12 @@ class PriceBook:
                     found[a["asset_key"]] = spot[symbol]
                 else:
                     log.info("no hyperliquid price for %s; it stays unpriced", symbol)
+                    if answered:
+                        missed.add(a["asset_key"])
 
+        for key in found:
+            self._missed.pop(key, None)
+        self._missed.update({key: now for key in missed})
         self._store(found)
         self._cache.update(found)
 

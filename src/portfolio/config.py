@@ -137,6 +137,13 @@ class PricesCfg(BaseModel):
     refreshes, so it takes a real outage rather than a blip, and an unpriced
     holding is a state the digest already knows how to say out loud."""
 
+    miss_ttl_minutes: int = 60
+    """How long an asset every source answered *without* a price is left alone.
+
+    Such an asset never becomes fresh, so without this it is asked again on
+    every refresh - a DexScreener request per token, every tick and every tap.
+    A source that failed is not an answer and does not start this clock."""
+
 
 class DigestCfg(BaseModel):
     enabled: bool = True

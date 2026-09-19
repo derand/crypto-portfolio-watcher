@@ -343,3 +343,83 @@ async def test_a_price_that_comes_back_is_used_again(conn, no_backoff):
     state["up"] = True
     await book.refresh([eth])
     assert book.usd("ethereum:native") == pytest.approx(2384.93)
+
+
+def missing_everywhere():
+    """CoinGecko and DexScreener both answer, and neither lists the token."""
+    return {("GET", "token_price"): {}, ("GET", "dexscreener"): {"pairs": []}}
+
+
+async def test_a_token_nobody_prices_is_not_asked_again_within_the_miss_ttl(conn):
+    """It never becomes fresh, so without a memory of the miss it cost one
+    DexScreener request on every refresh - every tick, and on every tap of
+    Refresh, whose TTL is a minute - for as long as the process lived."""
+    odd = register(conn, f"base:{ODD}", "base", ODD, "ODD")
+    book, seen = make_book(conn, missing_everywhere())
+    await book.refresh([odd])
+    asked = len(seen)
+    assert asked, "the first refresh has to ask"
+
+    await book.refresh([odd])
+    await book.refresh([odd], ttl_minutes=0)
+    assert len(seen) == asked, "a tap's short TTL must not reopen a settled miss"
+    assert book.usd(f"base:{ODD}") is None, "still unpriced, never zero"
+
+
+async def test_a_miss_is_asked_again_once_its_ttl_is_over(conn):
+    """The long tail gets listed eventually; a miss is a pause, not a verdict."""
+    odd = register(conn, f"base:{ODD}", "base", ODD, "ODD")
+    http, seen = client(missing_everywhere())
+    book = PriceBook(conn, PriceSources(client=http), miss_ttl_minutes=0)
+    await book.refresh([odd])
+    asked = len(seen)
+    await book.refresh([odd])
+    assert len(seen) > asked
+
+
+async def test_a_failed_source_is_not_a_miss(conn, no_backoff):
+    """A provider that answered 503 said nothing about the token. Resting it
+    for an hour would leave a priceable holding unpriced through one blip."""
+    odd = register(conn, f"base:{ODD}", "base", ODD, "ODD")
+    state = {"up": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "token_price" in str(request.url):
+            return httpx.Response(200, json={})          # CoinGecko: not listed
+        if not state["up"]:
+            return httpx.Response(503, json={})
+        return httpx.Response(200, json={"pairs": [
+            {"chainId": "base", "priceUsd": "0.4242",
+             "baseToken": {"address": ODD}, "liquidity": {"usd": 50000.0}}]})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    book = PriceBook(conn, PriceSources(client=http))
+    await book.refresh([odd])
+    assert book.usd(f"base:{ODD}") is None
+
+    state["up"] = True
+    await book.refresh([odd])
+    assert book.usd(f"base:{ODD}") == pytest.approx(0.4242)
+
+
+def test_only_what_something_reads_is_priced(conn):
+    """A token dropped from the whitelist is read by nothing, yet it kept being
+    priced - a request a refresh, and forever if nobody lists it. An LP leg is
+    not whitelisted either (`init-db` clears it), but the position is valued
+    through it, so it must stay."""
+    from portfolio.pipeline import priceable_assets
+    listed = register(conn, f"ethereum:{USDC}", "ethereum", USDC, "USDC")
+    dropped = register(conn, f"base:{ODD}", "base", ODD, "ODD")
+    leg_contract = "0x" + "ab" * 20
+    leg = register(conn, f"base:{leg_contract}", "base", leg_contract, "LEG")
+    conn.execute("UPDATE assets SET whitelisted=0 WHERE asset_key IN (?,?)",
+                 (dropped["asset_key"], leg["asset_key"]))
+    conn.execute("""INSERT INTO addresses(id, chain, address, label, added_at)
+                    VALUES (1, 'evm', '0x' || hex(randomblob(20)), 'a', '2026')""")
+    conn.execute("""INSERT INTO positions(address_id, protocol, position_key, asset_id,
+                                          amount_raw, updated_at)
+                    SELECT 1, 'univ3', '7:leg0', id, '1', '2026' FROM assets
+                     WHERE asset_key=?""", (leg["asset_key"],))
+
+    keys = {a["asset_key"] for a in priceable_assets(conn)}
+    assert keys == {listed["asset_key"], leg["asset_key"]}

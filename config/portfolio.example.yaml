@@ -26,6 +26,10 @@ prices:
   # quote a days-old price with nothing on screen to say so. Well above either
   # TTL on purpose: equal to one, a single failed request would blank the total.
   max_age_minutes: 180
+  # A token every source answered *without* a price (listed nowhere) is left
+  # alone this long, whichever TTL asked - otherwise each Refresh tap re-asks
+  # DexScreener about the whole long tail. A source that failed does not count.
+  miss_ttl_minutes: 60
 
 digest:
   enabled: true
