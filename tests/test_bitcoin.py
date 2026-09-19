@@ -113,7 +113,7 @@ async def test_first_sight_takes_a_baseline_instead_of_replaying_history():
     """Years of history must not arrive as notifications on day one."""
     old = [tx(f"h{i}", vin=[(THEM, 1000)], vout=[(ME, 900)]) for i in range(50)]
     a, _ = adapter({f"/address/{ME}": addr_doc(confirmed=(45_000, 0, 50)),
-                    f"/address/{ME}/txs": old})
+                    f"/address/{ME}/txs/chain": old})
     state = await a.fetch(TARGET, "", Cursor(), await a.probe(TARGET, "", Cursor()))
     assert state.transfers == []
     assert state.cursor.last_item == "h0", "cursor parked at the newest tx"
@@ -176,3 +176,105 @@ async def test_a_window_of_only_pending_transactions_leaves_the_cursor_alone():
                           await a.probe(TARGET, "", Cursor()))
     assert state.cursor.last_item == "older"
     assert len(state.transfers) == 1, "the pending transfer is still reported"
+
+
+async def test_a_first_sight_during_a_pending_transaction_takes_a_confirmed_baseline():
+    """Parked on the pending transaction mempool.space lists first, the cursor
+    was lost the moment that transaction was replaced or dropped, and the walk
+    read the address's whole history back as new transfers. The balance is
+    confirmed too, so what is pending happens after the baseline, not in it."""
+    settled = tx("old", vin=[(THEM, 100_000)], vout=[(ME, 100_000)], height=799_999)
+    a, _ = adapter({f"/address/{ME}": addr_doc(confirmed=(100_000, 0, 1), mem=(500_000, 0, 1)),
+                    f"/address/{ME}/txs/chain": [settled]})
+    state = await a.fetch(TARGET, "", Cursor(), await a.probe(TARGET, "", Cursor()))
+    assert state.cursor.last_item == "old"
+    assert state.cursor.last_block == 799_999
+    assert state.balances[0].amount_raw == 100_000, "the mempool is not the baseline"
+    assert state.transfers == []
+
+
+BTC_CFG = """
+db_path: {db}
+notify:
+  telegram:
+    enabled: false
+addresses:
+  - chain: bitcoin
+    address: {a}
+    label: btc
+    watch: [native]
+tokens: []
+"""
+
+
+class Chain:
+    """What mempool.space says, changeable between ticks."""
+
+    def __init__(self, confirmed, mem, txs):
+        self.confirmed, self.mem, self.txs = confirmed, mem, txs
+
+    def routes(self):
+        return {f"/address/{ME}": lambda: addr_doc(confirmed=self.confirmed, mem=self.mem),
+                f"/address/{ME}/txs": lambda: self.txs,
+                f"/address/{ME}/txs/chain": lambda: [t for t in self.txs
+                                                     if t["status"]["confirmed"]]}
+
+
+async def scan_twice(tmp_path, chain, after):
+    from portfolio import config as cfgmod
+    from portfolio import db as dbmod
+    from portfolio import pipeline
+    from test_pipeline import FakeRouter
+
+    p = tmp_path / "b.yaml"
+    p.write_text(BTC_CFG.format(db=tmp_path / "b.db", a=ME))
+    cfg = cfgmod.load(p, tmp_path / "missing.env")
+    conn = dbmod.connect(cfg.db_path)
+    dbmod.init(conn)
+    dbmod.sync_config(conn, cfg)
+    a, _ = adapter(chain.routes())
+    router = FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": a})          # baseline
+    assert router.sent == []
+    after(chain)
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": a})
+    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events ORDER BY id")]
+    return kinds, router
+
+
+def pending_at_first_sight():
+    history = [tx(f"h{i}", vin=[(THEM, 1000)], vout=[(ME, 1000)]) for i in range(5)]
+    pending = tx("rbf", vin=[(THEM, 500_000)], vout=[(ME, 500_000)], height=0)
+    return Chain((5_000, 0, 5), (500_000, 0, 1), [pending] + history), pending
+
+
+async def test_a_pending_transaction_replaced_after_the_baseline_replays_nothing(tmp_path):
+    """The case the old baseline got wrong: the transaction it parked on is
+    replaced (RBF) and its txid never appears again. The walk then ran to the
+    end of the history and announced every old transaction as new."""
+    chain, _ = pending_at_first_sight()
+
+    def replaced(c):
+        c.mem, c.txs = (0, 0, 0), c.txs[1:]
+
+    kinds, router = await scan_twice(tmp_path, chain, replaced)
+    assert kinds == [], "no history replayed, no anomaly: nothing happened"
+    assert router.sent == []
+
+
+async def test_a_pending_transaction_that_confirms_after_the_baseline_is_one_transfer(tmp_path):
+    """The other half of a confirmed baseline: the transaction is not in the
+    baseline balance, so when it confirms the balance moves by exactly what the
+    transfer says. Parking the cursor on a confirmed transaction while keeping
+    the mempool in the balance - the obvious fix - read it as a transfer plus
+    an anomaly. It is announced once, when it confirms; day one stays silent."""
+    chain, pending = pending_at_first_sight()
+
+    def confirms(c):
+        pending["status"] = {"confirmed": True, "block_height": 800_001,
+                             "block_time": 1700000600}
+        c.confirmed, c.mem = (505_000, 0, 6), (0, 0, 0)
+
+    kinds, router = await scan_twice(tmp_path, chain, confirms)
+    assert kinds == ["transfer"]
+    assert len(router.sent) == 1

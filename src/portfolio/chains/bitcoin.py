@@ -98,8 +98,22 @@ class BitcoinAdapter:
         if cursor.is_fresh:
             # First sight: adopt the current balance as the baseline. Replaying
             # years of history as notifications would be useless noise.
-            newest = await self._newest_txid(address)
-            state.cursor = Cursor(last_marker=probe.marker, last_item=newest)
+            #
+            # A confirmed baseline, cursor and balance alike. Parked on a pending
+            # transaction, the cursor was lost the moment it was replaced or
+            # dropped: the walk never met it again and read the whole history
+            # back as new transfers. Parked on the newest confirmed one while
+            # the balance kept the mempool, the pending transaction was in the
+            # balance and not in the events, so its confirmation read as money
+            # nothing explained. Leaving the mempool out makes whatever is
+            # pending simply happen after the baseline: a confirmation is one
+            # ordinary transfer, a replacement is nothing at all.
+            newest = await self._newest_confirmed(address)
+            state.balances[0].amount_raw = confirmed
+            state.cursor = Cursor(
+                last_marker=probe.marker,
+                last_item=newest["txid"] if newest else None,
+                last_block=newest["status"].get("block_height") if newest else None)
             return state
 
         txs, truncated = await self._txs_since(address, cursor.last_item)
@@ -121,9 +135,11 @@ class BitcoinAdapter:
             state.cursor.last_block = newest["status"].get("block_height")
         return state
 
-    async def _newest_txid(self, address: str) -> str | None:
-        txs = await self._get(f"/address/{address}/txs")
-        return txs[0]["txid"] if txs else None
+    async def _newest_confirmed(self, address: str) -> dict | None:
+        """`/txs/chain` lists confirmed transactions only, newest first - so a
+        first page that happens to be all mempool cannot leave this empty."""
+        txs = await self._get(f"/address/{address}/txs/chain")
+        return txs[0] if txs else None
 
     async def _txs_since(self, address: str, last_item: str | None):
         """Newest-first transactions up to (not including) last_item.
