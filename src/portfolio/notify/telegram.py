@@ -122,6 +122,14 @@ class TelegramNotifier:
                     what=what)
 
 
+class TelegramError(RuntimeError):
+    """Telegram answered, and the answer was a failure worth asking again.
+
+    A class of its own so a caller can tell "the service said no" from a bug in
+    this code: both would otherwise arrive as a bare RuntimeError.
+    """
+
+
 async def api(client, token: str, method: str, payload: dict) -> dict:
     """One Bot API call, with Telegram's own reason in the error.
 
@@ -136,7 +144,7 @@ async def api(client, token: str, method: str, payload: dict) -> dict:
     # 401 bad token, 400 bad chat_id: retrying asks the same question again.
     if 400 <= r.status_code < 500 and r.status_code != 429:
         raise Permanent(detail)
-    raise RuntimeError(detail)
+    raise TelegramError(detail)
 
 
 async def send_text(client, token: str, chat_id: str, text: str,

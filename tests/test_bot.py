@@ -52,11 +52,14 @@ class Telegram:
 
     def __init__(self, updates=None, edit_status=200,
                  edit_error="message is not modified", poll_failures=0,
-                 stop_when_empty=False):
+                 poll_error=None, stop_when_empty=False):
         self.updates = list(updates or [])
         # Telegram's own 502, which is what the real service does several times
         # a day; the count is how many polls in a row get it.
         self.poll_failures = poll_failures
+        # Raised instead of answering 502, when a failed poll should be
+        # something else: a timeout, or a fault nobody anticipated.
+        self.poll_error = poll_error
         # A test that drives run() needs the loop to end. 401 is the exit the
         # loop already has, and a mock transport answers instantly - so a poll
         # that always succeeds would spin without ever yielding to the test.
@@ -78,6 +81,8 @@ class Telegram:
             self.polls += 1
             if self.poll_failures > 0:
                 self.poll_failures -= 1
+                if self.poll_error is not None:
+                    raise self.poll_error(request)
                 return httpx.Response(502, text='{"ok":false,"description":"Bad Gateway"}')
             if self.stop_when_empty and not self.updates:
                 return httpx.Response(401, text='{"ok":false,"description":"Unauthorized"}')
@@ -475,12 +480,14 @@ async def test_a_command_prices_at_the_command_ttl_not_the_loops(setup):
     assert prices.ttls == [1], "the loop's 60 minutes must not reach a command"
 
 
-def flaky(setup, monkeypatch, failures):
-    """A bot whose Telegram answers 502 `failures` times, then serves /status
-    and shuts the loop down."""
+def flaky(setup, monkeypatch, failures, error=None):
+    """A bot whose Telegram fails `failures` polls - 502 unless `error` makes
+    the exception to raise from the request - then serves /status and shuts the
+    loop down."""
     cfg, conn = setup
     dbmod.set_meta(conn, botmod.OFFSET_KEY, "1")
-    tg = Telegram([update("/status")], poll_failures=failures, stop_when_empty=True)
+    tg = Telegram([update("/status")], poll_failures=failures, poll_error=error,
+                  stop_when_empty=True)
     bot = botmod.CommandBot(cfg, conn, Prices(), client=tg.client(), poll_timeout=0)
     monkeypatch.setattr(botmod, "_backoff", lambda failures: 0.0)
     return tg, bot
@@ -509,8 +516,8 @@ async def test_a_telegram_hiccup_costs_a_line_not_a_traceback(setup, monkeypatch
 
 async def test_an_outage_long_enough_to_matter_gets_loud(setup, monkeypatch, caplog):
     """The quiet treatment is for hiccups. A Telegram unreachable for several
-    polls in a row is a real fault, and the one traceback is what says which
-    fault it is - without repeating the stack for as long as the outage runs."""
+    polls in a row is a real fault, logged as an error for as long as it runs -
+    and announced over when it ends, or the last word in the log is "down"."""
     tg, bot = flaky(setup, monkeypatch, failures=botmod.LOUD_AFTER + 1)
     with caplog.at_level(logging.INFO, logger="portfolio.bot"):
         await asyncio.wait_for(bot.run(), timeout=5)
@@ -518,9 +525,42 @@ async def test_an_outage_long_enough_to_matter_gets_loud(setup, monkeypatch, cap
     assert tg.sent, "commands never came back"
     loud = [r for r in poll_failures(caplog) if r.levelno == logging.ERROR]
     assert len(loud) == 2
-    assert loud[0].exc_info and not loud[1].exc_info
+    assert all("502" in r.getMessage() for r in loud)
     assert any("telegram back after" in r.getMessage() for r in caplog.records), \
         "an outage announced has to be announced over"
+
+
+async def test_a_network_outage_is_loud_without_a_stack(setup, monkeypatch, caplog):
+    """A timeout says everything in its name. Its stack is sixty lines of httpx
+    internals, printed into the log of a VPS where it reads like a crash of the
+    watcher - which kept running and recovered on its own two minutes later."""
+    tg, bot = flaky(setup, monkeypatch, failures=botmod.LOUD_AFTER + 1,
+                    error=lambda request: httpx.ReadTimeout("", request=request))
+    with caplog.at_level(logging.INFO, logger="portfolio.bot"):
+        await asyncio.wait_for(bot.run(), timeout=5)
+
+    assert tg.sent, "commands never came back"
+    loud = [r for r in poll_failures(caplog) if r.levelno == logging.ERROR]
+    assert len(loud) == 2
+    assert not any(r.exc_info for r in loud)
+    # httpx timeouts stringify to "", which logged as "6 polls failed:" and
+    # then nothing - an error line that does not say what the error was.
+    assert all(r.getMessage().endswith("ReadTimeout") for r in poll_failures(caplog))
+
+
+async def test_an_unanticipated_failure_still_gets_its_one_traceback(
+        setup, monkeypatch, caplog):
+    """A fault in this code looks, from the loop, like any other failed poll.
+    The stack is the only thing that says which line it was, so the quiet
+    treatment for network errors must not swallow it."""
+    tg, bot = flaky(setup, monkeypatch, failures=botmod.LOUD_AFTER + 1,
+                    error=lambda request: KeyError("result"))
+    with caplog.at_level(logging.INFO, logger="portfolio.bot"):
+        await asyncio.wait_for(bot.run(), timeout=5)
+
+    loud = [r for r in poll_failures(caplog) if r.levelno == logging.ERROR]
+    assert len(loud) == 2
+    assert loud[0].exc_info and not loud[1].exc_info
 
 
 async def test_a_hiccup_at_startup_does_not_take_commands_away(setup, monkeypatch, caplog):

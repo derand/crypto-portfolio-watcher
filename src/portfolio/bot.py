@@ -26,7 +26,7 @@ from . import db as dbmod
 from . import digest
 from . import pipeline
 from .models import Block, EventKind, Message, Severity, flatten
-from .notify.telegram import TelegramNotifier, api, send_text
+from .notify.telegram import TelegramError, TelegramNotifier, api, send_text
 from .retry import Permanent
 
 log = logging.getLogger(__name__)
@@ -100,13 +100,28 @@ def _log_poll_failure(failures: int, exc: Exception) -> None:
     worth a traceback. Past that it stays loud but stops repeating the stack:
     the backoff has already capped, and an hour of downtime should read as an
     hour of downtime, not as an hour of crashes.
+
+    The traceback is for what nobody anticipated. A timeout or a 5xx already says
+    everything in its name, and its stack is sixty lines of httpx saying it again.
     """
+    what = _describe(exc)
     if failures < LOUD_AFTER:
-        log.warning("poll failed (%d): %s", failures, exc)
-    elif failures == LOUD_AFTER:
-        log.error("telegram unreachable, %d polls failed", failures, exc_info=exc)
+        log.warning("poll failed (%d): %s", failures, what)
+    elif failures == LOUD_AFTER and not isinstance(exc, NETWORK_ERRORS):
+        log.error("telegram unreachable, %d polls failed: %s", failures, what,
+                  exc_info=exc)
     else:
-        log.error("telegram unreachable, %d polls failed: %s", failures, exc)
+        log.error("telegram unreachable, %d polls failed: %s", failures, what)
+
+
+NETWORK_ERRORS = (httpx.TransportError, TelegramError)
+"""Failures of the route or of the service, as opposed to of this code."""
+
+
+def _describe(exc: Exception) -> str:
+    """The exception as one readable phrase. httpx's timeouts stringify to an
+    empty string, which logged as "6 polls failed:" with nothing after it."""
+    return str(exc) or type(exc).__name__
 
 
 LABEL = {"portfolio": "Portfolio", "digest": "Digest", "status": "Status",
