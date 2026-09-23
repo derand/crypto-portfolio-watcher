@@ -401,9 +401,9 @@ def cmd_catalog_check(args) -> int:
 
     entries = catalog.load()
     adapter = EvmAdapter(cfg.api_keys.alchemy)
-    # config.py allows more EVM networks than the adapter can reach, so the
-    # catalog may name one there is no provider for. That is a gap to report,
-    # not a crash on the first row.
+    # The catalog says what a reader could ask, not what the adapter reaches, so
+    # it may name a network with no endpoint yet. That is a gap to report, not a
+    # crash on the first row.
     reachable = {c: e for c, e in catalog.by_chain(entries).items() if c in NETWORKS}
     unreachable = {e.chain for e in entries} - set(reachable)
 

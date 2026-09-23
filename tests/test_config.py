@@ -71,6 +71,37 @@ def test_unknown_evm_chain_is_rejected(tmp_path):
 """)
 
 
+def test_a_network_the_adapter_cannot_reach_is_refused(tmp_path):
+    """Polygon was once in the allowed list with no endpoint behind it: the
+    address loaded, config-check printed it as watched, and every tick polled
+    it on nothing. A network is allowed because the adapter has it, or not at
+    all. If polygon gets an endpoint, pick another network it lacks."""
+    with pytest.raises(ValidationError, match="unknown EVM chains"):
+        load(tmp_path, """
+- chain: evm
+  address: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  label: main
+  chains: [ethereum, polygon]
+  watch: [native]
+""")
+
+
+def test_a_token_on_a_network_nobody_polls_is_refused():
+    """A whitelisted token there would be priced, listed, and never read - a
+    balance of zero that looks exactly like holding none."""
+    from portfolio.config import TokenCfg
+    with pytest.raises(ValidationError, match="unknown chain"):
+        TokenCfg(chain="polygon", contract="0x" + "b" * 40, symbol="X", decimals=18)
+
+
+def test_every_allowed_network_is_one_the_adapter_polls():
+    """The allowed set is derived, not typed: nothing config accepts can fall
+    through scopes() unpolled."""
+    from portfolio.chains.evm import NETWORKS
+    from portfolio.config import EVM_CHAINS
+    assert set(EVM_CHAINS) == set(NETWORKS)
+
+
 def test_duplicate_labels_rejected(tmp_path):
     with pytest.raises(ValidationError, match="duplicate labels"):
         load(tmp_path, """

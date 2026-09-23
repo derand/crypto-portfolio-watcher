@@ -14,10 +14,13 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .chains.evm import NETWORKS
 from .protocols import CHAIN_SCOPED_SOURCES, PROTOCOL_SOURCES
 
 CHAINS = {"bitcoin", "evm", "solana"}
-EVM_CHAINS = {"ethereum", "bsc", "arbitrum", "base", "polygon"}
+# Derived, like WATCH: a network the adapter has no endpoint for is refused at
+# load rather than accepted and then polled by nobody (PLAN §10.3).
+EVM_CHAINS = frozenset(NETWORKS)
 WATCH = {"native", "tokens"} | PROTOCOL_SOURCES
 
 _ENV_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")

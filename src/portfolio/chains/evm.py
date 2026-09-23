@@ -158,16 +158,8 @@ class EvmAdapter:
         # address watching beacon alone would otherwise get an empty scope list
         # and never be polled - the balances would still arrive from the beacon
         # source, so the gap is silent: numbers present, withdrawals missing.
-        chains = t.chains or (("ethereum",) if "beacon" in t.watch else ())
-        usable = []
-        for c in chains:
-            if c in NETWORKS:
-                usable.append(c)
-            elif c not in self._warned:
-                # Say it out loud rather than quietly watching nothing.
-                self._warned.add(c)
-                log.warning("%s: no transfer source for %s yet; skipping it", t.label, c)
-        return usable
+        # Every name here is a key of NETWORKS: config refuses any other.
+        return list(t.chains or (("ethereum",) if "beacon" in t.watch else ()))
 
     async def _rpc(self, scope: str, calls: list[tuple[str, list]],
                    allow_errors: bool = False, attempts: int = 3,

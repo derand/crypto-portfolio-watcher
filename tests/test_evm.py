@@ -336,16 +336,6 @@ async def test_hyperliquid_only_address_is_not_polled_on_any_network():
     assert requests == []
 
 
-async def test_unsupported_network_is_skipped_loudly(caplog):
-    """Polygon passes config validation but has no entry in NETWORKS yet:
-    say so instead of silently watching nothing."""
-    a, _ = adapter(dict(BALANCES))
-    with caplog.at_level("WARNING"):
-        scopes = a.scopes(target(chains=("ethereum", "polygon")))
-    assert scopes == ["ethereum"]
-    assert "polygon" in caplog.text
-
-
 async def test_bad_api_key_is_permanent_not_retried():
     def handler(request):
         return httpx.Response(401, json={"error": "bad key"})
