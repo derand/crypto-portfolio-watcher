@@ -91,6 +91,10 @@ class BalanceSnapshot:
     Not a third kind of yield flag: a debt residual is interest when it is small
     and a borrow when it is large, so the pipeline sizes it rather than trusting
     a flag. See TokenCfg.debt."""
+    silent_mint: bool = False
+    """True when the token is minted and burned without a `Transfer` event, so
+    no transfer ever explains its balance moving. The residual is a deposit or
+    a withdrawal, not money from nowhere. See TokenCfg.silent_mint."""
     yield_bearing: bool = False
     """True for shares whose redemption value grows on its own (ERC-4626).
 

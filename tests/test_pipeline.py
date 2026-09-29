@@ -1164,6 +1164,83 @@ async def test_repaying_is_told_from_borrowing_by_the_sign(tmp_path):
     assert row["detail"] == "repaid 600 variableDebtUSDC"
 
 
+
+class FakeSilentMintChain(FakeDebtChain):
+    """A staking receipt whose contract mints without a `Transfer` event: the
+    balance moves and the transfer list stays empty, as it does on chain."""
+
+    async def fetch(self, t, scope, cursor, probe):
+        held = self._now()
+        self.i += 1
+        return AddressState(
+            balances=[BalanceSnapshot(asset_key="ethereum:0xstake", amount_raw=held,
+                                      decimals=18, symbol="sSTAKE",
+                                      silent_mint=True)],
+            cursor=Cursor(last_marker=probe.marker))
+
+
+STAKE_PRICE = {"ethereum:0xstake": 0.05}
+
+
+async def test_a_deposit_minted_without_a_transfer_is_named_not_called_an_anomaly(tmp_path):
+    """Staking into a contract that emits no Transfer for its mint leaves nothing
+    in any transfer index to explain the new balance. Reported as an anomaly,
+    the owner's own deposit arrives as a high-severity alarm in raw wei."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeSilentMintChain([1250 * 10**18, 2201 * 10**18 + 5 * 10**17])
+    prices = FakePrices(STAKE_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    row = conn.execute("SELECT kind, detail, amount_raw FROM events").fetchone()
+    assert row["kind"] == "position_change"
+    assert row["detail"] == "minted 951.5 sSTAKE (no Transfer event)"
+    assert row["amount_raw"] == str(9515 * 10**17)
+    assert len(router.sent) == 1
+    assert router.sent[0].severity.value == "normal", "a deposit is not an alarm"
+
+
+async def test_a_withdrawal_burned_without_a_transfer_says_burned(tmp_path):
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeSilentMintChain([1000 * 10**18, 0])
+    prices = FakePrices(STAKE_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    row = conn.execute("SELECT detail FROM events").fetchone()
+    assert row["detail"] == "burned 1000 sSTAKE (no Transfer event)"
+
+
+async def test_a_small_silent_mint_is_recorded_quietly_and_never_as_yield(tmp_path):
+    """Under the threshold it must not ring - and it must not become an accrual
+    either, because the digest prints accruals as yield and a deposit summed
+    there reads as money earned."""
+    cfg, conn = setup_evm(tmp_path)
+    router = FakeRouter()
+    chain = FakeSilentMintChain([1000 * 10**18, 1010 * 10**18])   # +10 = $0.50
+    prices = FakePrices(STAKE_PRICE)
+    await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+    res = await pipeline.scan_once(cfg, conn, router, {"evm": chain}, prices=prices)
+
+    kinds = [r["kind"] for r in conn.execute("SELECT kind FROM events")]
+    assert kinds == ["position_change"]
+    assert res.below_threshold == 1
+    assert router.sent == []
+
+
+async def test_an_anomaly_reads_in_units_not_wei(tmp_path):
+    """The alert is read by someone deciding whether to worry; a 21-digit
+    integer makes them count digits before they can."""
+    cfg, conn = setup(tmp_path)
+    chain = FakeChain({A1: [(100_000, []), (900_000, [])], A2: [(0, [])]})
+    await pipeline.scan_once(cfg, conn, FakeRouter(), {"bitcoin": chain})
+    await pipeline.scan_once(cfg, conn, FakeRouter(), {"bitcoin": chain})
+
+    row = conn.execute("SELECT detail FROM events WHERE kind='anomaly'").fetchone()
+    assert row["detail"] == "balance moved +0.008 BTC but transfers explain +0 BTC"
+
 class FakeRangeSource:
     """A concentrated-liquidity position that moves in and out of its range."""
 

@@ -735,6 +735,23 @@ async def test_a_debt_balance_is_reported_negative():
     assert held[0].yield_bearing is False, "debt has its own rule, by size"
 
 
+
+async def test_silent_mint_rides_from_the_whitelist_into_the_balance():
+    """The pipeline decides by the snapshot alone. A flag lost on the way turns
+    every deposit into the contract back into an anomaly."""
+    stake = "0x" + "5" * 40
+    tokens = {"ethereum": [TokenCfg(chain="ethereum", contract=stake, symbol="sSTAKE",
+                                    decimals=18, silent_mint=True)]}
+    answers = {"eth_blockNumber": "0x100", "eth_getBalance": "0x0",
+               "alchemy_getTokenBalances": {"tokenBalances": [
+                   {"contractAddress": stake, "tokenBalance": hex(10**18)}]}}
+    a, _ = adapter(answers, tokens=tokens)
+    t = target()
+    probe = await a.probe(t, "ethereum", Cursor())
+    state = await a.fetch(t, "ethereum", Cursor(), probe)
+    held = [b for b in state.balances if b.asset_key == f"ethereum:{stake}"]
+    assert held[0].silent_mint is True and held[0].yield_bearing is False
+
 def test_receiving_a_debt_token_moves_the_balance_down():
     """Debt tokens are minted to the borrower, and Alchemy reports the mint as
     an ordinary incoming transfer. Counted as income it disagrees with the

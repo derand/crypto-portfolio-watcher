@@ -227,6 +227,7 @@ promise as money. Beacon validators are on-chain — the ETH is staked, not depo
 | balance grows on its own (Aave rebase, vault share) | `BalanceSnapshot.yield_bearing` | residual → `accrual`, silent |
 | a debt grows on its own (borrow interest) | `BalanceSnapshot.debt`, residual under the threshold | `accrual`, silent |
 | a debt jumps (borrow or repayment) | `BalanceSnapshot.debt`, residual over the threshold | `position_change` → alerts |
+| a token minted/burned with no `Transfer` event (staking receipt) | `BalanceSnapshot.silent_mint` | `position_change` "minted"/"burned"; alerts over the threshold |
 | position grows on its own (validator) | `Position.accrues` | change → `accrual`, silent |
 | position moves on its own, not income (LP legs, HL account) | `Position.drifts` | no event; `position_snapshots` only |
 | money appears with nothing to explain it | neither flag | `anomaly` → alerts |
@@ -272,6 +273,11 @@ Beyond `chain`/`contract`/`symbol`/`decimals`:
   and goes to the digest; over it, somebody borrowed or repaid and it alerts. That is why
   `coingecko_id` is required here, and why `debt` and `yield_bearing` together are refused:
   `yield_bearing` is checked first and would silence a six-figure borrow.
+- `silent_mint` — the contract mints and burns without emitting `Transfer`, so no transfer
+  index ever explains the balance and every deposit reads as an anomaly. The residual is
+  recorded as a `position_change` ("minted"/"burned"), alerted over `thresholds.notify_usd`,
+  and never as an `accrual`, which the digest would print as yield. Refused together with
+  `debt` or `yield_bearing`: both are checked first and would swallow it.
 - `group` — which holding this counts as in the digest: aBasWETH and WSTETH are both `ETH`.
   Display only, and never guessed from the symbol — ETHFI is not ETH. Empty means the token
   is its own group.

@@ -269,6 +269,16 @@ class TokenCfg(BaseModel):
     residual under `thresholds.notify_usd` is interest, anything larger is a
     borrow or a repayment. That rule needs a price, which is why coingecko_id
     is required below."""
+    silent_mint: bool = False
+    """True when the contract mints and burns without emitting `Transfer` - a
+    staking receipt that announces a deposit with an event of its own.
+
+    Transfer indexes are built from `Transfer` events, so such a balance moves
+    with nothing to explain it and every deposit reads as an anomaly. It is not
+    one: the change is the owner's own deposit or withdrawal, and saying so by
+    name is the whole fix. The change is recorded as a position change, alerted
+    over `thresholds.notify_usd` and kept quiet under it - never as accrual,
+    because a deposit summed into the digest would read as yield."""
     yield_bearing: bool = False
     """True when the balance grows on its own - an Aave aToken rebasing, or a
     share whose rate_call climbs. Such growth is yield, so it goes to the digest
@@ -319,6 +329,12 @@ class TokenCfg(BaseModel):
                 raise ValueError(f"{self.symbol}: debt needs coingecko_id naming "
                                  f"the borrowed asset; interest is told from a "
                                  f"borrow by what it is worth")
+        if self.silent_mint and (self.debt or self.yield_bearing):
+            # Each of those already claims the residual, and is checked first:
+            # the flag would never be reached and would only look like it works.
+            raise ValueError(f"{self.symbol}: silent_mint cannot be combined with "
+                             f"debt, yield_bearing or rate_call; they are "
+                             f"different rules for the same residual")
         object.__setattr__(self, "contract", self.contract.lower())
         return self
 

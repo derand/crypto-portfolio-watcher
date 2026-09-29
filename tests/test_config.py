@@ -306,3 +306,17 @@ def test_a_debt_token_with_a_price_is_accepted():
                         symbol="variableDebtUSDC", decimals=6,
                         coingecko_id="usd-coin", debt=True)
     assert t.debt is True and t.yield_bearing is False
+
+
+def test_silent_mint_cannot_share_a_token_with_another_residual_rule():
+    """debt and yield_bearing are checked first, so the pair would never reach
+    silent_mint: a deposit would pass as yield or as interest while the config
+    looked as if it said otherwise."""
+    with pytest.raises(ValidationError, match="silent_mint"):
+        cfgmod.TokenCfg(chain="ethereum", contract="0x" + "1" * 40,
+                        symbol="sSTAKE", decimals=18, yield_bearing=True,
+                        silent_mint=True)
+    with pytest.raises(ValidationError, match="silent_mint"):
+        cfgmod.TokenCfg(chain="ethereum", contract="0x" + "1" * 40,
+                        symbol="sSTAKE", decimals=18, coingecko_id="x",
+                        rate_call="convertToAssets(uint256)", silent_mint=True)

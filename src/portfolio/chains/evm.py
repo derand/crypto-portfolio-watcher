@@ -516,7 +516,7 @@ class EvmAdapter:
                 amount_raw=amount,
                 decimals=tok.decimals, symbol=tok.symbol,
                 block_height=probe.raw["tip"],
-                debt=tok.debt,
+                debt=tok.debt, silent_mint=tok.silent_mint,
                 yield_bearing=bool(rate) or tok.yield_bearing))
         return out
 

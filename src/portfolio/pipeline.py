@@ -268,8 +268,30 @@ def _record_debt_change(conn, chain: str, scope: str, address_id: int,
     return cur.lastrowid
 
 
+def _record_silent_mint(conn, chain: str, scope: str, address_id: int,
+                        asset_id: int, residual: int, symbol: str,
+                        decimals: int, usd: float | None) -> int:
+    """A token minted or burned without a `Transfer` event moved.
+
+    Not an anomaly: the contract is known to announce deposits some other way,
+    so no transfer index will ever explain its balance. The change is the
+    owner's own deposit or withdrawal, and is named as one.
+    """
+    verb = "minted" if residual > 0 else "burned"
+    detail = (f"{verb} {format_display(abs(residual), decimals)} {symbol}".strip()
+              + " (no Transfer event)")
+    cur = conn.execute(
+        """INSERT INTO events(chain, scope, address_id, asset_id, tx_hash, uid, kind,
+                              amount_raw, usd, ts, status, detail)
+           VALUES (?,?,?,?,'',?,?,?,?,?, 'confirmed', ?)""",
+        (chain, scope, address_id, asset_id, f"mint:{_now()}",
+         EventKind.POSITION_CHANGE.value, str(residual), usd, _now(), detail))
+    return cur.lastrowid
+
+
 def _record_anomaly(conn, chain: str, scope: str, address_id: int, asset_id: int,
-                    delta: int, explained: int) -> int:
+                    delta: int, explained: int, symbol: str = "",
+                    decimals: int = 0) -> int:
     """Balance moved by more than the transfers we found explain.
 
     On Bitcoin this should never fire: fees are already inside the net amount.
@@ -283,8 +305,16 @@ def _record_anomaly(conn, chain: str, scope: str, address_id: int, asset_id: int
            VALUES (?,?,?,?,'',?,?,?,?, 'confirmed', ?)""",
         (chain, scope, address_id, asset_id, f"reconcile:{_now()}",
          EventKind.ANOMALY.value, str(residual), _now(),
-         f"balance moved {delta:+d} but transfers explain {explained:+d}"))
+         f"balance moved {_signed(delta, decimals, symbol)} but transfers "
+         f"explain {_signed(explained, decimals, symbol)}"))
     return cur.lastrowid
+
+
+def _signed(raw: int, decimals: int, symbol: str) -> str:
+    """+951.724864 sAUTO rather than +951724864259262839755: an alert is read
+    by someone deciding whether to worry, not auditing wei."""
+    sign = "-" if raw < 0 else "+"
+    return f"{sign}{format_display(abs(raw), decimals)} {symbol}".rstrip()
 
 
 async def scan_once(cfg, conn, router, adapters, sources=None, prices=None) -> ScanResult:
@@ -508,6 +538,19 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
                     _record_accrual(conn, chain, scope, address_id, aid, residual,
                                     "borrow interest", accrued)
                 continue
+            if snap.silent_mint:
+                # No transfer index will ever explain this balance, so the
+                # residual is the owner's deposit or withdrawal. A position
+                # change, never an accrual: summed into the digest a deposit
+                # would read as yield.
+                eid = _record_silent_mint(conn, chain, scope, address_id, aid,
+                                          residual, snap.symbol, snap.decimals,
+                                          accrued)
+                if _worth_saying(cfg, accrued):
+                    _queue(conn, eid, channels)
+                else:
+                    res.below_threshold += 1
+                continue
             if snap.yield_bearing:
                 # The balance is shares x current rate while transfers are in
                 # shares: the two units never reconcile exactly, so treating
@@ -516,10 +559,13 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
                 _record_accrual(conn, chain, scope, address_id, aid, residual,
                                 "vault yield", accrued)
                 continue
-            eid = _record_anomaly(conn, chain, scope, address_id, aid, delta, accounted)
+            eid = _record_anomaly(conn, chain, scope, address_id, aid, delta,
+                                  accounted, snap.symbol, snap.decimals)
             _queue(conn, eid, channels)
-            log.warning("%s: %s moved %+d, transfers explain %+d",
-                        where, snap.symbol or snap.asset_key, delta, accounted)
+            log.warning("%s: %s moved %s, transfers explain %s",
+                        where, snap.symbol or snap.asset_key,
+                        _signed(delta, snap.decimals, ""),
+                        _signed(accounted, snap.decimals, ""))
 
         _save_cursor(conn, chain, address_id, state.cursor, scope)
         conn.execute("COMMIT")
