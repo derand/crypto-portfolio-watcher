@@ -872,8 +872,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                         if p.asset_key else None)
             # Before the silent shortcut below: a position whose amount is
             # deliberately silent can still have crossed a line.
-            eid = _state_event(conn, cfg, chain, address_id, p, prev)
-            if eid:
+            for eid in _state_events(conn, cfg, chain, address_id, p, prev):
                 res.new_events += 1
                 _queue(conn, eid, channels)
 
@@ -1139,18 +1138,71 @@ def _since_ms(conn, chain: str, address_id: int) -> int | None:
     return int(when.timestamp() * 1000)
 
 
-def _state_event(conn, cfg, chain: str, address_id: int, p, prev) -> int | None:
-    """An alert about a position's *state* rather than its size.
+def _state_events(conn, cfg, chain: str, address_id: int, p, prev) -> list[int]:
+    """Alerts about a position's *state* rather than its size.
 
     Separate from the amount diff, and reached even for positions marked
     `accrues` or `drifts`, because the two answer different questions. A
     perp's value moves every second and a range position's composition moves
     with every trade -
     both are noise - yet each can cross a line that is worth exactly one
-    message: liquidation coming close, liquidity falling out of range.
+    message: liquidation coming close, liquidity falling out of range, a
+    validator going offline, exiting or being slashed. A list, because a
+    validator can be slashed and start losing balance in the same tick.
     """
-    return (_liq_event(conn, cfg, chain, address_id, p, prev)
-            or _range_event(conn, chain, address_id, p, prev))
+    found = (_liq_event(conn, cfg, chain, address_id, p, prev),
+             _range_event(conn, chain, address_id, p, prev),
+             _status_event(conn, chain, address_id, p, prev),
+             _trend_event(conn, chain, address_id, p, prev))
+    return [eid for eid in found if eid]
+
+
+def _status_event(conn, chain: str, address_id: int, p, prev) -> int | None:
+    """A validator's status changed, or it was slashed.
+
+    Without this an exit, and even a slashing, reached nobody: the balance is
+    `accrues`, so the drop it brings is recorded as negative yield and the
+    status itself only moved the marker. No threshold - each of these happens
+    a handful of times in a validator's life, and every one is news.
+    """
+    now = p.extra.get("status")
+    if not now or prev is None:
+        return None
+    was = _extra(prev)
+    if p.extra.get("slashed") == "True" and was.get("slashed") != "True":
+        text = f"{p.protocol} {p.key} was SLASHED (status {now})"
+    elif was.get("status") and was["status"] != now:
+        text = f"{p.protocol} {p.key} status: {was['status']} -> {now}"
+    else:
+        return None
+    return _position_event(conn, chain, address_id, f"{p.key}:status:{now}",
+                           text, p.amount_raw)
+
+
+def _trend_event(conn, chain: str, address_id: int, p, prev) -> int | None:
+    """A validator's balance started falling, or growing again.
+
+    On the transition, as with the range: a validator that has been offline
+    for a day is old news, the hour it went down is the news. A source that has
+    no trend to report yet - just restarted, or a sweep restarted its window -
+    leaves the stored one in place rather than erasing it, or a validator that
+    came back during that gap would never be said to have.
+    """
+    was = _extra(prev).get("trend") if prev is not None else None
+    now = p.extra.get("trend")
+    if now is None:
+        if was is not None:
+            p.extra["trend"] = was
+        return None
+    if was is None or was == now:
+        return None
+    if now == "down":
+        text = (f"{p.protocol} {p.key} is losing balance - offline? "
+                f"({_fmt(p.amount_raw, p.decimals)} {p.symbol})")
+    else:
+        text = f"{p.protocol} {p.key} is earning again"
+    return _position_event(conn, chain, address_id, f"{p.key}:trend:{now}",
+                           text, p.amount_raw)
 
 
 def _range_event(conn, chain: str, address_id: int, p, prev) -> int | None:

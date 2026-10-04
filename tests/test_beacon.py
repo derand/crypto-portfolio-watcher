@@ -82,3 +82,91 @@ async def test_a_validator_the_answer_leaves_out_costs_the_tick():
     with pytest.raises(Unavailable) as e:
         await s.fetch(TARGET)
     assert "2" in str(e.value)
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def ticking(balances, start=0.0, step=900.0):
+    """A source answering each balance in turn, fifteen minutes apart."""
+    rows = iter(balances)
+    clock = Clock()
+    clock.now = start - step
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        clock.now += step
+        return httpx.Response(200, json={"data": [validator(balance_gwei=next(rows))]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return BeaconSource({ME: [999999]}, url="http://beacon", client=client, clock=clock)
+
+
+async def trends(balances):
+    s = ticking(balances)
+    out = []
+    for _ in balances:
+        positions, _ = await s.fetch(TARGET)
+        out.append(positions[0].extra.get("trend"))
+    return out
+
+
+BASE = 32_000_000_000
+EARN = 19_000          # gwei a validator gains in fifteen minutes
+
+
+async def test_no_trend_until_an_hour_has_been_seen():
+    """A trend read off one tick is noise: a single missed attestation is a
+    small loss. An hour is ~9 attestations, and losing most of them is what
+    offline looks like."""
+    got = await trends([BASE + i * EARN for i in range(6)])
+    assert got == [None, None, None, None, "up", "up"]
+
+
+async def test_a_falling_balance_reads_down():
+    falling = [BASE + 100_000 - i * 15_000 for i in range(6)]
+    got = await trends(falling)
+    assert got[4:] == ["down", "down"]
+
+
+async def test_one_missed_attestation_does_not_read_down():
+    """A working validator misses an attestation now and then; the hour's
+    earnings cover it."""
+    bal = [BASE, BASE + EARN, BASE + 2 * EARN - 30_000, BASE + 3 * EARN - 30_000,
+           BASE + 4 * EARN - 30_000]
+    assert (await trends(bal))[4] == "up"
+
+
+async def test_the_withdrawal_sweep_is_not_a_loss():
+    """Every week or so the excess over 32 ETH leaves for the withdrawal
+    address. Read as a loss, every sweep would page "offline" about a
+    validator that never missed a thing."""
+    high = BASE + 14_000_000
+    bal = [high, high + EARN, high + 2 * EARN, high + 3 * EARN, high + 4 * EARN,
+           BASE + 100, BASE + 100 + EARN]
+    got = await trends(bal)
+    assert got[4] == "up"
+    assert "down" not in got, got
+
+
+async def test_a_slashing_is_a_loss_not_a_sweep():
+    """It is a large drop too, but it lands below the effective balance."""
+    high = BASE + 14_000_000
+    bal = [high + i * EARN for i in range(5)] + [BASE - 1_000_000_000] * 5
+    got = await trends(bal)
+    assert got[-1] == "down"
+
+
+async def test_the_trend_moves_the_marker():
+    """An offline validator loses a milli-ETH only every half a day. Without
+    the trend in the marker the pipeline would not hear of it for that long."""
+    s = ticking([BASE + 500_000 - i * 15_000 for i in range(5)])
+    markers = []
+    for _ in range(5):
+        _, m = await s.fetch(TARGET)
+        markers.append(m)
+    assert markers[3] != markers[4]

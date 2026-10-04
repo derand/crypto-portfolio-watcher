@@ -16,6 +16,7 @@ transfers they are.
 """
 
 import logging
+import time
 
 import httpx
 
@@ -29,17 +30,24 @@ API = "https://ethereum-beacon-api.publicnode.com"
 GWEI = 10 ** 9
 NATIVE_DECIMALS = 18
 MARKER_DP = 3          # milli-ETH: the balance ticks every epoch, see _marker
+TREND_WINDOW = 3600.0  # seconds; see _trend
+SWEEP_MIN_GWEI = 10 ** 6   # 0.001 ETH: more than an offline validator loses between ticks
 
 
 class BeaconSource:
     name = "beacon"
 
     def __init__(self, validators: dict[str, list[int]] | None = None,
-                 url: str = API, client: httpx.AsyncClient | None = None):
+                 url: str = API, client: httpx.AsyncClient | None = None,
+                 clock=time.monotonic):
         self._validators = validators or {}      # lowercased address -> indexes
         self._url = url.rstrip("/")
         self._client = client
         self._own = client is None
+        self._clock = clock
+        # index -> [(when, balance in gwei)], oldest first. In memory only: a
+        # restart forgets it, and the trend is simply absent for one window.
+        self._seen: dict[str, list[tuple[float, int]]] = {}
 
     async def aclose(self) -> None:
         if self._own and self._client is not None:
@@ -81,20 +89,54 @@ class BeaconSource:
         positions = []
         for entry in states:
             index = entry.get("index")
-            balance = int(entry.get("balance", 0)) * GWEI
+            gwei = int(entry.get("balance", 0))
+            balance = gwei * GWEI
             validator = entry.get("validator") or {}
+            status = entry.get("status", "")
+            effective = int(validator.get("effective_balance", 0))
+            extra = {"status": status,
+                     "slashed": str(validator.get("slashed", "")),
+                     "effective": str(effective // GWEI)}
+            trend = self._trend(str(index), gwei, effective, status)
+            if trend:
+                extra["trend"] = trend
             positions.append(Position(
                 protocol="beacon", key=f"validator:{index}", symbol="ETH",
                 amount_raw=balance, decimals=NATIVE_DECIMALS,
                 asset_key="ethereum:native",
                 # The balance grows every epoch; that is yield, not an event.
-                accrues=True,
-                extra={"status": entry.get("status", ""),
-                       "slashed": str(validator.get("slashed", "")),
-                       "effective": str(int(validator.get("effective_balance", 0))
-                                        // GWEI)}))
+                accrues=True, extra=extra))
         positions.sort(key=lambda p: p.key)
         return positions, self._marker(positions)
+
+    def _trend(self, index: str, gwei: int, effective: int,
+               status: str) -> str | None:
+        """"up" or "down" against the balance at least an hour ago, or None.
+
+        An online validator gains about 0.00008 ETH an hour. To end the hour
+        lower it has to miss most of the ~9 attestations in it, which a working
+        one does not do - so a lower balance means it is offline, and nothing
+        finer is needed. None until a full window has been seen.
+
+        The withdrawal sweep takes the excess over the effective balance every
+        week or so, and that drop is not a loss: a fall of more than a tick's
+        worth that still leaves the balance at or above the effective one
+        restarts the window instead of being read as one. A slashing lands
+        below the effective balance and is read as the loss it is.
+        """
+        if not status.startswith("active"):
+            self._seen.pop(index, None)
+            return None
+        now = self._clock()
+        seen = self._seen.setdefault(index, [])
+        if seen and seen[-1][1] - gwei >= SWEEP_MIN_GWEI and gwei >= effective:
+            seen.clear()
+        seen.append((now, gwei))
+        old = [i for i, (when, _) in enumerate(seen) if now - when >= TREND_WINDOW]
+        if not old:
+            return None
+        del seen[:old[-1]]                  # keep the newest reading old enough
+        return "up" if gwei > seen[0][1] else "down"
 
     @staticmethod
     def _marker(positions: list[Position]) -> str:
@@ -104,11 +146,14 @@ class BeaconSource:
         look busy while telling us nothing new. A thousandth of an ETH moves
         about twice a day at mainnet rates - often enough that the reported
         figure stays honest. Status is exact: an exit or a slashing must never
-        be rounded away.
+        be rounded away. So is the trend: an offline validator loses a
+        milli-ETH only every half a day, and the marker is what lets the
+        pipeline hear about it within the hour.
         """
         parts = []
         for p in positions:
             coarse = p.amount_raw // (10 ** (NATIVE_DECIMALS - MARKER_DP))
             parts.append(f"{p.key}={coarse}:{p.extra.get('status', '')}"
-                         f":{p.extra.get('slashed', '')}")
+                         f":{p.extra.get('slashed', '')}"
+                         f":{p.extra.get('trend', '')}")
         return "|".join(parts)

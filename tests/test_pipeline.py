@@ -1765,3 +1765,95 @@ async def test_a_venue_asked_about_closes_cannot_escape_the_tick_either(tmp_path
     assert res.failed and "hl-1/hyperliquid" in res.failed[0]
     assert conn.execute("SELECT COUNT(*) FROM positions WHERE position_key='perp:ETH'"
                         ).fetchone()[0] == 1, "nothing closed on the strength of a bad read"
+
+
+class FakeValidatorSource:
+    """One validator, whose status and balance trend change tick by tick."""
+
+    name = "beacon"
+
+    def __init__(self, states):
+        self.states = states          # list of (status, slashed, trend or None)
+        self.i = 0
+
+    async def fetch(self, t):
+        status, slashed, trend = self.states[min(self.i, len(self.states) - 1)]
+        self.i += 1
+        extra = {"status": status, "slashed": slashed, "effective": "32"}
+        if trend:
+            extra["trend"] = trend
+        p = Position(protocol="beacon", key="validator:999999", symbol="ETH",
+                     amount_raw=32 * 10 ** 18 + self.i, decimals=18,
+                     asset_key="ethereum:native", accrues=True, extra=extra)
+        return [p], f"{status}:{slashed}:{trend}:{self.i}"
+
+
+BEACON_CFG = EVM_CFG.replace("watch: [native]",
+                             "watch: [native, beacon]\n    validators: [999999]")
+
+
+def setup_beacon(tmp_path):
+    p = tmp_path / "b.yaml"
+    p.write_text(BEACON_CFG.format(db=tmp_path / "b.db", a=EVM))
+    cfg = cfgmod.load(p, tmp_path / "missing.env")
+    conn = dbmod.connect(cfg.db_path)
+    dbmod.init(conn)
+    dbmod.sync_config(conn, cfg)
+    return cfg, conn
+
+
+async def run_validator(tmp_path, states):
+    cfg, conn = setup_beacon(tmp_path)
+    router = FakeRouter()
+    src = FakeValidatorSource(states)
+    for _ in states:
+        await pipeline.scan_once(cfg, conn, router, {}, {"beacon": src})
+    return [m.body for m in router.sent]
+
+
+ON = ("active_ongoing", "False")
+
+
+async def test_a_validator_going_offline_and_back_is_said_once_each(tmp_path):
+    """Nothing else watches the operators. Said on every tick, the hour it went
+    down would be buried under the hours it stayed down."""
+    said = await run_validator(tmp_path, [
+        (*ON, "up"), (*ON, "down"), (*ON, "down"), (*ON, "up"), (*ON, "up")])
+    assert len(said) == 2, said
+    assert "losing balance" in said[0] and "999999" in said[0]
+    assert "earning again" in said[1]
+
+
+async def test_a_validator_first_seen_offline_does_not_alert(tmp_path):
+    """Day one records; it does not announce a state of unknown age."""
+    said = await run_validator(tmp_path, [(*ON, "down"), (*ON, "down")])
+    assert said == []
+
+
+async def test_recovery_during_a_gap_in_the_trend_is_still_said(tmp_path):
+    """A restart, or a withdrawal sweep, leaves the source without a trend for
+    an hour. Stored as "no trend", that hour would erase the "down" - and a
+    validator that came back inside it would never be said to have."""
+    said = await run_validator(tmp_path, [
+        (*ON, "up"), (*ON, "down"), (*ON, None), (*ON, "up")])
+    assert len(said) == 2, said
+    assert "earning again" in said[1]
+
+
+async def test_an_exit_is_said(tmp_path):
+    """The balance accrues, so the status was the only thing that moved - and
+    it moved only the marker. Starting an exit used to reach nobody."""
+    said = await run_validator(tmp_path, [
+        (*ON, "up"), ("active_exiting", "False", "up"),
+        ("active_exiting", "False", "up")])
+    assert len(said) == 1, said
+    assert "active_ongoing -> active_exiting" in said[0]
+
+
+async def test_a_slashing_is_said(tmp_path):
+    """A slashing costs about an ETH, which an `accrues` balance records as
+    negative yield and nothing else. The status alone has to speak."""
+    said = await run_validator(tmp_path, [
+        (*ON, "up"), ("active_slashed", "True", "down")])
+    assert any("SLASHED" in s for s in said), said
+    assert any("losing balance" in s for s in said), said
