@@ -67,7 +67,8 @@ def collect(conn, prices=None, claim_reminders: list[dict] | None = None) -> dic
     for row in positions:
         # Perp notionals are exposure, not holdings. What a perp does add is its
         # unrealised PnL: the margin behind it is already sitting in the spot
-        # balance, but the profit on top of it is not.
+        # balance, and the source takes the PnL out of that balance so that it
+        # is counted here, once.
         if row["position_key"].startswith("perp:"):
             try:
                 total += float(row["extra"].get("unrealized_pnl") or 0)

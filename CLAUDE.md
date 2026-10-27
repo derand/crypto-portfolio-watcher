@@ -165,7 +165,10 @@ the digest looked like before, and PLAN §9 records the fix.
 **Hyperliquid is one balance, not two.** Perp margin is reserved inside the spot USDC
 balance (`hold` == `marginUsed`), so `accountValue` is margin already counted plus PnL:
 the total takes spot balances and each perp's unrealised PnL, never `accountValue` and
-never a notional. PLAN §6 has the measurements.
+never a notional. The venue also folds that PnL into the collateral's spot `total`, so the
+source reports `spot:USDC` as `total − Σ unrealizedPnl` - otherwise every price move on an
+open perp is announced as a balance change and the PnL is counted twice. PLAN §6 has the
+measurements.
 
 **A closed position reports the exchange's realised figure, or no figure at all.**
 `events.pnl_usd` is filled from the venue's own fills (`trades()`), summed across the

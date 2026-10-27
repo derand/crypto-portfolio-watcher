@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import httpx
 
@@ -122,6 +123,41 @@ async def test_marker_moves_with_the_whole_percent_from_liquidation():
     _, four = await at("3750.0").fetch(TARGET)
     assert twenty == still_twenty
     assert len({twenty, nineteen, four}) == 3
+
+
+async def test_a_price_move_on_an_open_perp_is_not_a_spot_balance_change():
+    """The venue folds unrealised PnL into the collateral's spot `total`: here a
+    short loses 18 cents and `total` drops by exactly that. Taken as is, the
+    tick announced "USDC -$0.18" - every fifteen minutes, both ways, for as long
+    as the perp stayed open - and the marker moved with it, so every tick paid
+    for the full fetch."""
+    def at(total, pnl):
+        s, _ = source(perp_state([position(szi="-0.04", value="94.0", entry="2300.0",
+                                           liq="25000.0", pnl=pnl)]),
+                      spot_state(("USDC", total)))
+        return s
+    first, m1 = await at("500.0", "-1.80").fetch(TARGET)
+    second, m2 = await at("499.82", "-1.98").fetch(TARGET)
+    usdc = [{p.key: p for p in ps}["spot:USDC"] for ps in (first, second)]
+    assert usdc[0].amount_raw == usdc[1].amount_raw == 50180000000
+    assert m1 == m2
+
+
+async def test_the_collateral_plus_the_perps_pnl_is_the_venues_own_total():
+    """Whatever is taken out of the spot balance must come back through the
+    perps, or the portfolio total is wrong by the PnL - and it was, the other
+    way round: the digest added the PnL on top of a balance already holding it.
+    Several perps share the one collateral; a non-collateral coin is left alone."""
+    s, _ = source(perp_state([position(coin="ETH", pnl="12.5"),
+                              position(coin="BTC", szi="-0.1", pnl="-20.25")]),
+                  spot_state(("USDC", "1000.0"), ("HYPE", "3.0")))
+    positions, _ = await s.fetch(TARGET)
+    by_key = {p.key: p for p in positions}
+    pnl = sum(int(Decimal(by_key[k].extra["unrealized_pnl"]) * 10**8)
+              for k in ("perp:ETH", "perp:BTC"))
+    assert by_key["spot:USDC"].amount_raw + pnl == 100000000000
+    assert by_key["spot:USDC"].extra["total"] == "1000.0"
+    assert by_key["spot:HYPE"].amount_raw == 300000000
 
 
 async def test_zero_size_positions_are_dropped():

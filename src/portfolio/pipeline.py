@@ -922,11 +922,11 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                 if eid:
                     res.new_events += 1
                     # The same threshold transfers get. A Hyperliquid spot
-                    # balance drifts by a fraction of a cent every time funding
-                    # settles, and without this every tick announces it: the
-                    # position path used to queue unconditionally. Measured in
-                    # the *change*, not the position - a $500 deposit still
-                    # speaks, a 1.2-cent funding payment does not.
+                    # balance moves by cents every time funding settles, and
+                    # without this every settlement announces it: the position
+                    # path used to queue unconditionally. Measured in the
+                    # *change*, not the position - a $500 deposit still speaks,
+                    # a 1.2-cent funding payment does not.
                     if _worth_saying(cfg, moved):
                         _queue(conn, eid, channels)
                     else:

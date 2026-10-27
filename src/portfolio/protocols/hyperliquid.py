@@ -35,6 +35,10 @@ STAKE_SYMBOL = "HYPE"                      # the only stakeable asset on Hyperli
 # token that merely calls itself UBTC cannot borrow bitcoin's price.
 SPOT_WRAPPERS = {"UBTC": "BTC", "UETH": "ETH", "USOL": "SOL"}
 
+# What the perps on the default dex are margined in, and therefore the spot
+# balance their unrealised PnL is folded into.
+COLLATERAL = "USDC"
+
 # delegatorSummary field -> our position key suffix
 STAKE_BUCKETS = (("delegated", "delegated"),
                  ("undelegated", "undelegated"),
@@ -81,7 +85,9 @@ class HyperliquidSource:
         spot = await self._info({"type": "spotClearinghouseState", "user": t.address})
         stake = await self._info({"type": "delegatorSummary", "user": t.address})
 
-        positions = (self._account(perp) + self._perps(perp) + self._spot(spot)
+        perps = self._perps(perp)
+        pnl = sum((_dec(p.extra["unrealized_pnl"]) for p in perps), Decimal(0))
+        positions = (self._account(perp) + perps + self._spot(spot, pnl)
                      + self._staking(stake))
         return positions, self.marker(positions)
 
@@ -96,7 +102,8 @@ class HyperliquidSource:
         the same trick as the tick bucket in univ3 - because a change of bucket
         is the one thing about a drifting position that is worth a diff. Left
         out, the liquidation warning was only ever evaluated on a tick where a
-        size happened to move, which in practice meant "when funding settled".
+        size happened to move - which in practice was every tick, because the
+        spot balance used to carry the unrealised PnL (see `_spot`).
         """
         parts = []
         for p in positions:
@@ -182,7 +189,19 @@ class HyperliquidSource:
         return out
 
     @staticmethod
-    def _spot(state: dict) -> list[Position]:
+    def _spot(state: dict, pnl: Decimal = Decimal(0)) -> list[Position]:
+        """Spot balances, with the collateral's reported as money actually held.
+
+        The venue's `total` for the collateral includes the unrealised PnL of
+        every open perp: on a live account each tick's change in it equalled the
+        change in `unrealizedPnl` to the last digit, both ways, every fifteen
+        minutes. Taken as is, that is a mark-to-market move announced as a
+        balance change ("USDC -$1.24" for a price move on a short), and the PnL
+        is counted twice by anything that adds the perps' PnL on top. So the
+        PnL is taken out here: what remains moves only when money does - a
+        deposit, a withdrawal, funding settling, a close realising its result.
+        The venue's own figure is kept in `extra`.
+        """
         out = []
         for bal in state.get("balances") or []:
             total = _dec(bal.get("total"))
@@ -190,12 +209,17 @@ class HyperliquidSource:
                 continue                    # zero rows are listed for every token
             coin = bal.get("coin", "?")
             token = bal.get("token")
+            extra = {"hold": str(bal.get("hold", "0"))}
+            held = total
+            if coin == COLLATERAL and pnl:
+                held = total - pnl
+                extra["total"] = str(total)
             out.append(Position(
                 protocol="hyperliquid", key=f"spot:{coin}", symbol=coin,
-                amount_raw=_scaled(total), decimals=SCALE,
+                amount_raw=_scaled(held), decimals=SCALE,
                 asset_key=f"hyperliquid:{coin}",
                 contract="" if token is None else str(token),
-                extra={"hold": str(bal.get("hold", "0"))}))
+                extra=extra))
         return out
 
 
