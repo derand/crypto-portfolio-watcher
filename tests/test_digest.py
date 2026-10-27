@@ -125,6 +125,36 @@ def test_exchange_account_value_is_not_added_to_the_spot_balance(setup):
     assert data["total"] == pytest.approx(38500.0 + 103.92)
     assert "account" not in digest.render_state(conn, data, cfg).body
 
+def test_an_open_perps_pnl_is_listed_where_the_tables_add_up_to_the_total(setup):
+    """The source takes the perps' PnL out of the collateral's spot balance, and
+    the total adds it back from the perp. A table that lists only the spot row
+    then shows the exchange $1.80 richer than it is, and no line anywhere says
+    where the difference went - the PnL was only in the exposure block, which
+    is not part of any sum."""
+    cfg, conn, aid, _ = setup
+    conn.execute("""INSERT INTO assets(asset_key, chain, contract, symbol, decimals,
+                                       kind, whitelisted)
+                    VALUES ('hyperliquid:USDC','hyperliquid',NULL,'USDC',8,'perp',1)""")
+    usdc = conn.execute("SELECT id FROM assets WHERE asset_key='hyperliquid:USDC'").fetchone()[0]
+    conn.execute("""INSERT INTO positions(address_id, protocol, position_key, asset_id,
+                                          amount_raw, usd, extra, updated_at)
+                    VALUES (?,'hyperliquid','spot:USDC',?,?,NULL,'{}',?)""",
+                 (aid, usdc, str(500_00_000_000), "2026-01-01"))
+    conn.execute("""INSERT INTO positions(address_id, protocol, position_key,
+                                          amount_raw, usd, extra, updated_at)
+                    VALUES (?,'hyperliquid','perp:ETH',?,?,?,?)""",
+                 (aid, str(-4_000_000), 94.0,
+                  '{"side": "short", "unrealized_pnl": "-1.80"}', "2026-01-01"))
+    data = digest.collect(conn, Prices({"bitcoin:native": 77000.0,
+                                        "hyperliquid:USDC": 1.0}))
+    rows = digest._holdings(data, cfg)
+    assert sum(r["usd"] for r in rows) == pytest.approx(data["total"])
+    pnl = [r for r in rows if r["symbol"] == "PnL"]
+    assert [(r["usd"], r["group"], r["venue"]) for r in pnl] == [
+        (-1.80, "USDC", "hyperliquid")]
+    assert "HYPERLIQUID  $498" in digest.render_state(conn, data, cfg).body
+
+
 def test_staked_holding_is_priced_by_its_asset_not_its_key(setup):
     """"staking:pending" ends in a bucket name, not a coin. Deriving the asset
     from the key leaves a four-figure holding silently unpriced."""

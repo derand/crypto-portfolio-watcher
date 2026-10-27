@@ -9,10 +9,10 @@ import json
 import logging
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from . import db as dbmod
-from .protocols.hyperliquid import SPOT_WRAPPERS
+from .protocols.hyperliquid import COLLATERAL, SPOT_WRAPPERS
 from .models import (Block, Direction, EventKind, Message, Severity, flatten,
                      format_display, format_units)
 
@@ -212,9 +212,27 @@ def _holdings(data: dict, cfg) -> list[dict]:
                      "group": grouped(r["asset_key"], r["symbol"])})
     for r in data["positions"]:
         key = r["position_key"]
+        if key.startswith("perp:"):
+            # The notional is exposure, but the unrealised PnL is money the
+            # total already counts - and since the source takes it out of the
+            # collateral's spot balance, a table without this row no longer
+            # adds up to the total, by exactly the PnL. Grouped with the
+            # collateral, because that is what it settles into.
+            try:
+                pnl = Decimal(str(r["extra"].get("unrealized_pnl") or 0))
+            except InvalidOperation:
+                continue
+            if pnl:
+                rows.append({"raw": int(pnl.scaleb(8)), "decimals": 8,
+                             "symbol": "PnL", "usd": float(pnl), "label": r["label"],
+                             "venue": r["protocol"],
+                             "where": _where(r["label"], key=key),
+                             "group": grouped(f"{r['protocol']}:{COLLATERAL}",
+                                              COLLATERAL)})
+            continue
         # "account" is the exchange's own view of margin already held in spot;
         # listing it as a holding is the double count that collect() drops.
-        if key.startswith("perp:") or key == "account" or int(r["amount_raw"]) == 0:
+        if key == "account" or int(r["amount_raw"]) == 0:
             continue
         symbol = r["symbol"] or key.rpartition(":")[2]
         scale = _scale(r)
