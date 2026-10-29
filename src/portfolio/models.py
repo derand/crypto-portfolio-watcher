@@ -222,3 +222,6 @@ class Message:
     blocks: list[Block] = field(default_factory=list)
     """Structured form of the same content. `body` stays authoritative: a
     channel that ignores blocks must still say everything."""
+    image: bytes | None = None
+    """A PNG the text is the caption of. Only /chart sets it, and only the
+    command bot sends it; an alert is never a picture."""

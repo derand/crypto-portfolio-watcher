@@ -167,6 +167,13 @@ class DigestCfg(BaseModel):
     money push the real holdings off the screen."""
 
 
+class ChartCfg(BaseModel):
+    theme: Literal["light", "dark"] = "dark"
+    """The /chart picture's colours. A PNG cannot follow the app's own theme,
+    so this is a choice made once; dark by default, because a light picture
+    opened in a dark chat at night is a flashlight."""
+
+
 class ApiKeys(BaseModel):
     alchemy: str = ""
     etherscan: str = ""
@@ -349,6 +356,7 @@ class Config(BaseModel):
     thresholds: Thresholds = Thresholds()
     prices: PricesCfg = PricesCfg()
     digest: DigestCfg = DigestCfg()
+    chart: ChartCfg = ChartCfg()
     notify: NotifyCfg = NotifyCfg()
     api_keys: ApiKeys = ApiKeys()
     addresses: list[AddressCfg] = Field(default_factory=list)

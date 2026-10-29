@@ -329,6 +329,65 @@ def cmd_portfolio(args) -> int:
     return 0
 
 
+def cmd_history(args) -> int:
+    """The total as an hourly series, rebuilt from snapshots; prints CSV.
+
+    --check compares it against the totals the digest actually delivered,
+    which is how a wrong rebuild shows itself before anything is drawn.
+    """
+    from datetime import timedelta
+    from . import history
+
+    cfg, conn = _open(args)
+    h = history.History(conn, timedelta(minutes=cfg.prices.max_age_minutes))
+    if h.first is None:
+        print("no snapshots yet", file=sys.stderr)
+        return 1
+    if args.check:
+        rows = conn.execute("SELECT ts, usd, unpriced FROM total_snapshots "
+                            "ORDER BY ts").fetchall()
+        print(f"{'digest (local)':<16} {'delivered':>12} {'rebuilt':>12} "
+              f"{'diff':>10} {'%':>7}")
+        worst = 0.0
+        for r in rows:
+            ts = history._ts(r["ts"])
+            if ts < h.first:
+                print(f"{ts.astimezone():%Y-%m-%d %H:%M} {r['usd']:>12,.2f} "
+                      f"{'(before history)':>31}")
+                continue
+            usd, unpriced = h.total_at(ts)
+            diff = usd - r["usd"]
+            pct = diff / r["usd"] * 100 if r["usd"] else 0.0
+            worst = max(worst, abs(pct))
+            note = "".join(f"  unpriced {n} {who}" for n, who in
+                           ((r["unpriced"], "then"), (unpriced, "now")) if n)
+            print(f"{ts.astimezone():%Y-%m-%d %H:%M} {r['usd']:>12,.2f} {usd:>12,.2f} "
+                  f"{diff:>+10,.2f} {pct:>+6.2f}%{note}")
+        print(f"\nworst disagreement {worst:.2f}%")
+        return 0
+    since = (datetime.now(timezone.utc) - timedelta(days=args.days)
+             if args.days else None)
+    print("ts,usd,unpriced")
+    for point in h.series(since=since):
+        print(f"{point.ts.isoformat(timespec='seconds')},{point.usd:.2f},{point.unpriced}")
+    return 0
+
+
+def cmd_chart(args) -> int:
+    """The same series drawn as a PNG, to look at before a bot sends one."""
+    from datetime import timedelta
+    from . import chart, history
+
+    cfg, conn = _open(args)
+    h = history.History(conn, timedelta(minutes=cfg.prices.max_age_minutes))
+    since = (datetime.now(timezone.utc) - timedelta(days=args.days)
+             if args.days else None)
+    png = chart.render(h.series(since=since), theme=args.theme or cfg.chart.theme)
+    Path(args.out).write_bytes(png)
+    print(f"{args.out}: {len(png):,} bytes")
+    return 0
+
+
 def cmd_discover_tokens(args) -> int:
     """Propose whitelist candidates. Read-only: never writes the config."""
     cfg = cfgmod.load(args.config, args.env)
@@ -554,6 +613,21 @@ def main(argv=None) -> int:
     p_digest = sub.add_parser("digest", help="portfolio summary; sent unless --dry-run")
     p_digest.add_argument("--dry-run", action="store_true",
                           help="print it without sending or recording the total")
+    p_history = sub.add_parser(
+        "history", help="the total as an hourly series rebuilt from snapshots; CSV")
+    p_history.add_argument("--days", type=int, default=0,
+                           help="only the last N days (default: everything)")
+    p_history.add_argument("--check", action="store_true",
+                           help="compare against the totals the digest delivered")
+    p_chart = sub.add_parser("chart", help="the history series drawn as a PNG")
+    # Under data/ by default: ignored by git, and a picture of the portfolio's
+    # value is exactly what must not be committed by accident.
+    p_chart.add_argument("--out", default="data/chart.png",
+                         help="where to write it (default: data/chart.png)")
+    p_chart.add_argument("--days", type=int, default=0,
+                         help="only the last N days (default: everything)")
+    p_chart.add_argument("--theme", choices=("light", "dark"),
+                         help="override chart.theme from the config")
     p_disc = sub.add_parser("discover-tokens",
                             help="propose whitelist candidates; prints YAML, writes nothing")
     p_disc.add_argument("--min-usd", type=float, default=10.0,
@@ -582,6 +656,8 @@ def main(argv=None) -> int:
         "bot": cmd_bot,
         "digest": cmd_digest,
         "portfolio": cmd_portfolio,
+        "history": cmd_history,
+        "chart": cmd_chart,
         "test-notify": cmd_test_notify,
         "telegram-chat-id": cmd_telegram_chat_id,
     }

@@ -1,9 +1,10 @@
-# Runtime dependencies, pinned. The whole list: the four packages the project
+# Runtime dependencies, pinned. The whole list: the five packages the project
 # imports, plus the keccak backend one of them needs.
 httpx==0.28.1        # every provider client
 pydantic==2.12.5     # config validation
 PyYAML==6.0.3        # config/portfolio.yaml
 eth-utils==5.3.1     # keccak, for EVM call selectors
+Pillow==12.1.1       # the /chart PNG; chosen over matplotlib for size (PLAN §7)
 # eth-utils imports keccak lazily and raises ImportError without a backend. It
 # normally arrives as a dependency of web3, which this project does not install,
 # so the backend has to be asked for explicitly.

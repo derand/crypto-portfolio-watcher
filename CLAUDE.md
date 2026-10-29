@@ -24,6 +24,8 @@ user, not a step.
 ./pw watch                   # scan on a loop
 ./pw portfolio               # what is held now, at today's prices (--send to deliver)
 ./pw digest --dry-run        # daily summary without sending or recording
+./pw history --check         # hourly total rebuilt from snapshots (CSV); --check vs digests
+./pw chart --days 30         # that series as a PNG, to data/chart.png (--theme dark)
 ./pw discover-tokens         # propose whitelist candidates (--show-unpriced, --min-usd)
 ./pw discover-protocols      # propose positions the token index cannot see
 ./pw catalog-check           # verify every catalog entry still enumerates
@@ -142,7 +144,11 @@ storage is arithmetic with nothing available to check it against.
 **Commands are the same code, read-only** (`bot.py`). `watch` runs the tick loop and a
 Telegram long-poll loop as two asyncio tasks in one process; `/portfolio` and `/digest`
 render exactly what the CLI renders, `/scan` calls the loop's own tick under a shared lock,
-and `/digest` deliberately does not record the total the daily baseline is measured from.
+and `/digest` deliberately does not record the total the daily baseline is measured from. `/chart` is
+the one answer that is a picture: `history.py` rebuilds the hourly total from snapshots through
+`digest.total_of` - the digest's own valuation, so the two cannot disagree on the same rows -
+and `chart.py` draws it with Pillow; `./pw history --check` replays every delivered digest
+against the rebuild.
 The getUpdates offset lives in `meta`; a cold start drops the backlog rather than replaying
 a day of commands. The menu is `setMyCommands` plus inline buttons under each
 answer, where Refresh edits that message in place; a reply keyboard was tried and removed,

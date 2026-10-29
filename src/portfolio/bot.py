@@ -17,16 +17,20 @@ week-old /scan running again.
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from . import chart
 from . import db as dbmod
 from . import digest
+from . import history
 from . import pipeline
 from .models import Block, EventKind, Message, Severity, flatten
-from .notify.telegram import TelegramError, TelegramNotifier, api, send_text
+from .notify.telegram import (TelegramError, TelegramNotifier, api, edit_photo,
+                              send_photo, send_text)
 from .retry import Permanent
 
 log = logging.getLogger(__name__)
@@ -65,6 +69,7 @@ pays that again for numbers that move by cents. Same argument as
 HELP = [
     ("portfolio", "what is held now, at today's prices"),
     ("digest", "the daily summary on demand (records nothing)"),
+    ("chart", "value over time: /chart 1d, 7d, 30d or all"),
     ("status", "what the database holds: addresses, events, queue"),
     ("health", "is the watcher alive: last tick, stale cursors"),
     ("scan", "force a tick (expensive; alerts arrive separately)"),
@@ -125,15 +130,15 @@ def _describe(exc: Exception) -> str:
 
 
 LABEL = {"portfolio": "Portfolio", "digest": "Digest", "status": "Status",
-         "health": "Health", "scan": "Scan", "help": "Help"}
+         "health": "Health", "scan": "Scan", "help": "Help", "chart": "Chart"}
 
 BUTTONS = {
     "portfolio": ["portfolio", "digest", "scan"],
-    "digest": ["digest", "portfolio"],
+    "digest": ["digest", "portfolio", "chart"],
     "status": ["status", "health"],
     "health": ["health", "scan", "status"],
     "scan": ["portfolio", "health"],
-    "help": ["portfolio", "digest", "status", "health"],
+    "help": ["portfolio", "digest", "chart", "status", "health"],
 }
 """What to offer under each answer; the first entry repeats the command itself
 and is drawn as Refresh.
@@ -145,7 +150,29 @@ edits that message in place - which is what Telegram's own guidance asks for.
 The command list (setMyCommands) stays the canonical way in."""
 
 
-def markup(command: str) -> dict | None:
+PERIODS = {"1d": 1, "7d": 7, "30d": 30, "all": None}
+"""What /chart offers as buttons, in days; None is everything recorded. A
+typed /chart 90d works too - the buttons are the common answers, not a limit."""
+DEFAULT_PERIOD = "30d"
+PERIOD = re.compile(r"(\d{1,4})d")
+
+
+def period(arg: str) -> str:
+    """The period a /chart argument names, or the default for anything else."""
+    arg = arg.lower()
+    return arg if arg == "all" or PERIOD.fullmatch(arg) else DEFAULT_PERIOD
+
+
+def markup(command: str, arg: str = "") -> dict | None:
+    if command == "chart":
+        # The periods and nothing else: a chart is a message of its own, which
+        # only ever turns into another period of itself. They are one command
+        # with an argument, so the one on screen is the Refresh. Short labels,
+        # so four fit where three words do.
+        names = {p: "All" if p == "all" else p.upper() for p in PERIODS}
+        return {"inline_keyboard": [[
+            {"text": f"\U0001f504 {names[p]}" if p == arg else names[p],
+             "callback_data": f"cmd:chart:{p}"} for p in PERIODS]]}
     names = BUTTONS.get(command)
     if not names:
         return None
@@ -293,6 +320,7 @@ class CommandBot:
             "health": lambda: health_message(self._cfg, self._conn),
             "scan": self._scan_now,
             "help": help_message,
+            "chart": self._chart,
         }
 
     async def aclose(self) -> None:
@@ -327,7 +355,7 @@ class CommandBot:
         return (await api(self._client, self._token, "getUpdates", payload)).get("result", [])
 
     async def _reply(self, chat_id: str, msg: Message, command: str = "help",
-                     edit: int | None = None) -> str | None:
+                     edit: int | None = None, arg: str = "") -> str | None:
         """Send the answer, or rewrite the message the button hangs under.
 
         Editing needs the whole answer to be one message; a digest long enough
@@ -337,7 +365,9 @@ class CommandBot:
         already on screen.
         """
         texts = self._render.texts(msg)
-        buttons = markup(command)
+        buttons = markup(command, arg)
+        if msg.image is not None:
+            return await self._reply_photo(chat_id, msg.image, texts[0], buttons, edit)
         if edit is not None and len(texts) == 1:
             try:
                 await api(self._client, self._token, "editMessageText",
@@ -362,6 +392,21 @@ class CommandBot:
             # piece of a split digest draws three rows of them.
             await send_text(self._client, self._token, chat_id, text,
                             buttons if i == len(texts) - 1 else None)
+        return None
+
+    async def _reply_photo(self, chat_id: str, png: bytes, caption: str,
+                           buttons: dict | None, edit: int | None) -> str | None:
+        """`_reply` for a picture: the same edit-or-send, with media calls."""
+        if edit is not None:
+            try:
+                await edit_photo(self._client, self._token, chat_id, edit, png,
+                                 caption, buttons)
+                return None
+            except Permanent as e:
+                if NOT_MODIFIED in str(e):
+                    return "No change"
+                log.info("photo edit declined, sending instead: %s", e)
+        await send_photo(self._client, self._token, chat_id, png, caption, buttons)
         return None
 
     async def _announce(self) -> None:
@@ -445,12 +490,14 @@ class CommandBot:
             return None
         text = (msg.get("text") or "").strip()
         # "/portfolio@my_bot arg" - the suffix appears whenever the chat is a group.
-        name = text.split()[0].lstrip("/").split("@")[0].lower() if text.startswith("/") else ""
+        words = text.split() if text.startswith("/") else []
+        name = words[0].lstrip("/").split("@")[0].lower() if words else ""
         name = ALIAS.get(name, name)
         if name not in self._handlers:
             await self._reply(chat, help_message(), "help")
             return None
-        await self._reply(chat, await self._run(name), name)
+        arg = self._arg(name, words[1] if len(words) > 1 else "")
+        await self._reply(chat, await self._run(name, arg), name, arg=arg)
         return name
 
     async def _tap(self, query: dict) -> str | None:
@@ -459,18 +506,26 @@ class CommandBot:
         No staleness check here, unlike a typed command. The date on the
         message a button hangs under is when the *bot* wrote it, and tapping
         Refresh on yesterday's portfolio is a question asked now.
+
+        Only a message of the same kind is rewritten: text into text, a picture
+        into a picture. `editMessageMedia` will happily turn a text message into
+        a photo - Chart tapped under /digest used to replace the digest with a
+        chart - so the rule cannot be left to what Telegram refuses.
         """
         message = query.get("message") or {}
         chat = str((message.get("chat") or {}).get("id", ""))
-        name = str(query.get("data", "")).removeprefix("cmd:")
+        name, _, arg = str(query.get("data", "")).removeprefix("cmd:").partition(":")
         if chat != self._chat or name not in self._handlers:
             await self._ack(query.get("id"))
             return None
+        arg = self._arg(name, arg)
         note = ""
         try:
-            answer = await self._run(name)
+            answer = await self._run(name, arg)
+            same_kind = bool(message.get("photo")) == (answer.image is not None)
             note = await self._reply(chat, answer, name,
-                                     edit=message.get("message_id")) or ""
+                                     edit=message.get("message_id") if same_kind else None,
+                                     arg=arg) or ""
         finally:
             # Unacknowledged, the button spins until Telegram gives up on it.
             # The note is the only answer when the message did not change.
@@ -486,11 +541,17 @@ class CommandBot:
         except Exception as e:  # noqa: BLE001
             log.debug("answerCallbackQuery failed: %s", e)
 
-    async def _run(self, name: str) -> Message:
+    @staticmethod
+    def _arg(name: str, arg: str) -> str:
+        """The argument as the command will use it. Only /chart takes one."""
+        return period(arg) if name == "chart" else ""
+
+    async def _run(self, name: str, arg: str = "") -> Message:
         """The command itself. A failure is an answer, never an exception:
         a broken price source must not cost the whole command channel."""
         try:
-            result = self._handlers[name]()
+            handler = self._handlers[name]
+            result = handler(arg) if arg else handler()
             return await result if asyncio.iscoroutine(result) else result
         except Exception as e:  # noqa: BLE001
             log.exception("/%s failed", name)
@@ -557,3 +618,37 @@ class CommandBot:
             body += "\nfailed: " + ", ".join(res.failed[:5])
         return Message(title="Scan", body=body,
                        severity=Severity.LOW, kind=EventKind.SERVICE)
+
+    def _chart(self, arg: str = DEFAULT_PERIOD) -> Message:
+        """The value series as a picture, from SQLite alone.
+
+        No price refresh and no scan: every point is already recorded, and the
+        last one is the last scan - the same state /portfolio reads, so the two
+        answers agree. History is rebuilt on each request, under a second on
+        seven weeks; run inline, which pauses the tick loop for that long.
+        """
+        days = PERIODS.get(arg) if arg in PERIODS else int(arg[:-1])
+        since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+        h = history.History(self._conn,
+                            timedelta(minutes=self._cfg.prices.max_age_minutes))
+        points = h.series(since=since)
+        label = "all" if days is None else arg
+        try:
+            png = chart.render(points, theme=self._cfg.chart.theme)
+        except ValueError as e:
+            return Message(title="Chart", body=str(e), severity=Severity.LOW,
+                           kind=EventKind.SERVICE)
+        priced = [p for p in points if not p.unpriced]
+        high = max(priced, key=lambda p: p.usd)
+        low = min(priced, key=lambda p: p.usd)
+        lines = [f"high ${high.usd:,.0f}  ·  {_when(high.ts)}",
+                 f"low  ${low.usd:,.0f}  ·  {_when(low.ts)}"]
+        block = Block(lines=lines, mono=False)
+        return Message(title=f"Portfolio value · {label}", body=flatten([block]),
+                       blocks=[block], severity=Severity.LOW, kind=EventKind.SERVICE,
+                       image=png)
+
+
+def _when(ts: datetime) -> str:
+    local = ts.astimezone()
+    return f"{local:%b} {local.day} {local:%H:%M}"

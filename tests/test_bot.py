@@ -2,11 +2,17 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
+from email.parser import BytesParser
+from email.policy import default as email_policy
+from io import BytesIO
 
 import httpx
 import pytest
+from PIL import Image
 
 from portfolio import bot as botmod
+from portfolio import chart
 from portfolio import config as cfgmod
 from portfolio import db as dbmod
 
@@ -68,6 +74,8 @@ class Telegram:
         self.sent: list[dict] = []
         self.edited: list[dict] = []
         self.acked: list[str] = []
+        self.photos: list[dict] = []
+        self.photo_edits: list[dict] = []
         self.calls: list[str] = []
         self.edit_status = edit_status
         # Which 400 it is decides the answer, so a test has to be able to pick.
@@ -76,7 +84,7 @@ class Telegram:
     def handler(self, request: httpx.Request) -> httpx.Response:
         method = request.url.path.rsplit("/", 1)[-1]
         self.calls.append(method)
-        payload = json.loads(request.content or b"{}")
+        payload = _form(request) or json.loads(request.content or b"{}")
         if method == "getUpdates":
             self.polls += 1
             if self.poll_failures > 0:
@@ -96,10 +104,38 @@ class Telegram:
             if self.edit_status != 200:
                 return httpx.Response(self.edit_status, text=self.edit_error)
             self.edited.append(payload)
+        if method == "sendPhoto":
+            self.photos.append(payload)
+        if method == "editMessageMedia":
+            if self.edit_status != 200:
+                return httpx.Response(self.edit_status, text=self.edit_error)
+            self.photo_edits.append(payload)
         return httpx.Response(200, json={"ok": True, "result": True})
 
     def client(self):
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+
+
+def _form(request: httpx.Request) -> dict | None:
+    """A multipart upload's fields: JSON ones decoded, files as bytes."""
+    kind = request.headers.get("content-type", "")
+    if not kind.startswith("multipart/"):
+        return None
+    message = BytesParser(policy=email_policy).parsebytes(
+        b"Content-Type: " + kind.encode() + b"\r\n\r\n" + request.read())
+    fields = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        data = part.get_payload(decode=True)
+        if part.get_filename():
+            fields[name] = data
+            continue
+        text = data.decode()
+        try:
+            fields[name] = json.loads(text)
+        except ValueError:
+            fields[name] = text
+    return fields
 
 
 def update(text: str, uid: int = 1, chat: str = "42", date=None) -> dict:
@@ -109,12 +145,16 @@ def update(text: str, uid: int = 1, chat: str = "42", date=None) -> dict:
                         "text": text}}
 
 
-def tap(data: str, chat: str = "42", message_id: int = 1, uid: int = 2) -> dict:
+def tap(data: str, chat: str = "42", message_id: int = 1, uid: int = 2,
+        photo: bool = False) -> dict:
+    """A button press. `photo` marks the message it hangs under as a picture,
+    which Telegram reports as a `photo` list of sizes."""
+    message = {"message_id": message_id, "date": int(time.time()),
+               "chat": {"id": chat, "type": "private"}}
+    if photo:
+        message["photo"] = [{"file_id": "f", "width": 1080, "height": 810}]
     return {"update_id": uid,
-            "callback_query": {"id": "cb1", "data": data,
-                               "message": {"message_id": message_id,
-                                           "date": int(time.time()),
-                                           "chat": {"id": chat, "type": "private"}}}}
+            "callback_query": {"id": "cb1", "data": data, "message": message}}
 
 
 @pytest.fixture()
@@ -601,3 +641,109 @@ def test_a_telegram_that_stays_down_is_asked_less_and_less():
     assert waits[1] > waits[0]
     assert all(w <= botmod.BACKOFF_CAP for w in waits)
     assert waits[-1] > botmod.BACKOFF_CAP / 2, "jitter must not swallow the cap"
+
+
+def history(setup, hours=48):
+    """Two days of hourly snapshots and prices, ending now: enough to draw."""
+    cfg, conn = setup
+    aid = conn.execute("SELECT id FROM addresses").fetchone()[0]
+    sid = conn.execute("SELECT id FROM assets").fetchone()[0]
+    now = datetime.now(timezone.utc)
+    for h in range(hours, -1, -1):
+        ts = (now - timedelta(hours=h)).isoformat()
+        conn.execute("""INSERT INTO balance_snapshots(address_id, asset_id, amount_raw, ts)
+                        VALUES (?,?,?,?)""", (aid, sid, "50000000", ts))
+        conn.execute("INSERT INTO prices(asset_id, usd, source, ts) VALUES (?,?,?,?)",
+                     (sid, 100_000.0 + 500 * (h % 7), "market", ts))
+
+
+async def test_chart_answers_with_a_picture_and_its_periods(setup):
+    """The value over time is a picture or nothing: Telegram cannot draw a
+    line out of text, and a sparkline of block characters has no axis."""
+    history(setup)
+    tg = Telegram()
+    bot = make(setup, tg)
+    assert await bot.handle(update("/chart")) == "chart"
+    assert tg.sent == [] and len(tg.photos) == 1
+    photo = tg.photos[0]
+    assert Image.open(BytesIO(photo["photo"])).size == (chart.WIDTH, chart.HEIGHT)
+    assert "high $" in photo["caption"] and "low  $" in photo["caption"]
+    rows = photo["reply_markup"]["inline_keyboard"]
+    assert len(rows) == 1, "a chart offers its periods and nothing else"
+    periods = rows[0]
+    assert [b["callback_data"] for b in periods] == [
+        "cmd:chart:1d", "cmd:chart:7d", "cmd:chart:30d", "cmd:chart:all"]
+    assert periods[2]["text"].endswith("30D") and periods[2]["text"] != "30D", \
+        "the period on screen is the one drawn as Refresh"
+
+
+async def test_the_picture_is_dark_unless_the_config_says_otherwise(setup):
+    """A light picture opened in a dark chat at night is a flashlight."""
+    history(setup)
+    tg = Telegram()
+    bot = make(setup, tg)
+    await bot.handle(update("/chart"))
+    img = Image.open(BytesIO(tg.photos[0]["photo"])).convert("RGB")
+    assert img.getpixel((2, chart.HEIGHT - 2)) == chart._rgb(chart.THEMES["dark"]["surface"])
+
+
+async def test_a_period_button_redraws_the_picture_it_hangs_under(setup):
+    """Switching from 30 days to 7 is the same question asked closer; a new
+    picture per tap stacks four charts in the chat to compare one."""
+    history(setup)
+    tg = Telegram()
+    bot = make(setup, tg)
+    assert await bot.handle(tap("cmd:chart:7d", message_id=9, photo=True)) == "chart"
+    assert tg.photos == [] and len(tg.photo_edits) == 1
+    edit = tg.photo_edits[0]
+    assert edit["message_id"] == 9
+    assert edit["media"]["media"] == "attach://chart" and edit["chart"][:4] == b"\x89PNG"
+    assert "· 7d" in edit["media"]["caption"]
+    assert tg.acked == [""], "the tap is acknowledged"
+
+
+async def test_the_chart_button_under_a_digest_leaves_the_digest_alone(setup):
+    """`editMessageMedia` turns a text message into a photo without complaint:
+    Chart tapped under /digest replaced the morning summary with a picture, and
+    the numbers it carried were gone from the chat. A chart is a message of
+    its own."""
+    history(setup)
+    tg = Telegram()
+    bot = make(setup, tg)
+    await bot.handle(tap("cmd:chart", message_id=3))
+    assert "editMessageMedia" not in tg.calls
+    assert len(tg.photos) == 1
+    assert "cmd:chart:30d" in json.dumps(tg.photos[0]["reply_markup"])
+
+
+async def test_a_text_answer_never_rewrites_a_chart(setup):
+    """The other direction of the same rule. An old chart carries a Portfolio
+    button from before it lost one; tapping it must not overwrite the picture."""
+    tg = Telegram()
+    bot = make(setup, tg)
+    await bot.handle(tap("cmd:portfolio", message_id=4, photo=True))
+    assert "editMessageText" not in tg.calls
+    assert len(tg.sent) == 1
+
+
+async def test_a_typed_period_is_honoured_and_nonsense_falls_back(setup):
+    """/chart 90d is a fair question with no button; /chart banana is not a
+    reason to answer with a failure."""
+    history(setup)
+    tg = Telegram()
+    bot = make(setup, tg)
+    await bot.handle(update("/chart 90d"))
+    await bot.handle(update("/chart banana", uid=2))
+    captions = [p["caption"] for p in tg.photos]
+    assert "· 90d" in captions[0] and "· 30d" in captions[1]
+
+
+async def test_no_history_yet_is_an_answer_not_a_failure(setup):
+    """A fresh install has nothing to draw. Saying "Failed" there reads as a
+    broken bot rather than a young one."""
+    tg = Telegram()
+    bot = make(setup, tg)
+    await bot.handle(update("/chart"))
+    assert tg.photos == []
+    assert "not enough history" in tg.sent[0]["text"]
+    assert "Failed" not in tg.sent[0]["text"]

@@ -36,9 +36,6 @@ def collect(conn, prices=None, claim_reminders: list[dict] | None = None) -> dic
         WHERE a.enabled = 1 AND s.whitelisted = 1
               AND CAST(b.amount_raw AS INTEGER) != 0
         ORDER BY a.label, s.asset_key""")
-    for row in balances:
-        row["usd"] = (prices.value(row["asset_key"], int(row["amount_raw"]),
-                                   row["decimals"]) if prices else None)
 
     positions = _rows(conn, """
         SELECT a.label, p.protocol, p.position_key, p.amount_raw, p.usd, p.extra,
@@ -57,6 +54,36 @@ def collect(conn, prices=None, claim_reminders: list[dict] | None = None) -> dic
         LEFT JOIN assets s ON s.id = e.asset_id
         WHERE e.ts >= ? ORDER BY e.ts""", (since,))
 
+    total, unpriced = total_of(balances, positions, prices)
+
+    # Stored in UTC, shown in local time: "as of 10:39" next to a scan the
+    # reader watched run at 13:39 reads as a stale database.
+    stamps = [r["updated_at"] for r in balances if r["updated_at"]]
+    as_of = ""
+    if stamps:
+        try:
+            local = datetime.fromisoformat(max(stamps)).astimezone()
+            as_of = local.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            as_of = max(stamps)[:16].replace("T", " ")
+
+    return {"balances": balances, "positions": positions, "recent": recent,
+            "total": total, "unpriced": unpriced, "as_of": as_of,
+            "claim_reminders": claim_reminders or []}
+
+
+def total_of(balances: list[dict], positions: list[dict], prices) -> tuple[float, int]:
+    """What the holdings are worth, and how many of them nothing could price.
+
+    The one valuation of the portfolio. The digest asks it about now; the
+    history asks it about every hour in the past, with rows rebuilt from
+    snapshots and a price book that answers as of that hour - so a chart and
+    the morning total can only disagree where their inputs do. Fills in `usd`
+    on the rows it priced, which the tables are drawn from.
+    """
+    for row in balances:
+        row["usd"] = (prices.value(row["asset_key"], int(row["amount_raw"]),
+                                   row["decimals"]) if prices else None)
     total = 0.0
     unpriced = 0
     for row in balances:
@@ -96,21 +123,7 @@ def collect(conn, prices=None, claim_reminders: list[dict] | None = None) -> dic
                 row["usd"] = value
             else:
                 unpriced += 1
-
-    # Stored in UTC, shown in local time: "as of 10:39" next to a scan the
-    # reader watched run at 13:39 reads as a stale database.
-    stamps = [r["updated_at"] for r in balances if r["updated_at"]]
-    as_of = ""
-    if stamps:
-        try:
-            local = datetime.fromisoformat(max(stamps)).astimezone()
-            as_of = local.strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            as_of = max(stamps)[:16].replace("T", " ")
-
-    return {"balances": balances, "positions": positions, "recent": recent,
-            "total": total, "unpriced": unpriced, "as_of": as_of,
-            "claim_reminders": claim_reminders or []}
+    return total, unpriced
 
 
 def _scale(row) -> int:

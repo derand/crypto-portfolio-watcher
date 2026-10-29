@@ -37,6 +37,9 @@ digest:
   # table_width: 37   # characters that fit on one line of a collapsed block in
   #                   # Telegram; wider tables wrap. Moves with the app's font size.
 
+chart:
+  theme: dark    # light | dark - the /chart picture cannot follow the app's theme
+
 notify:
   telegram:
     enabled: true

@@ -12,6 +12,7 @@ alignment inside the collapsed section.
 """
 
 import html
+import json
 import logging
 
 import httpx
@@ -137,6 +138,23 @@ async def api(client, token: str, method: str, payload: dict) -> dict:
     same distinction between "retrying may help" and "asking again is pointless".
     """
     r = await client.post(f"{API}/bot{token}/{method}", json=payload)
+    return _answer(method, r)
+
+
+async def upload(client, token: str, method: str, payload: dict,
+                 files: dict[str, tuple[str, bytes, str]]) -> dict:
+    """`api`, for a call carrying a file: multipart rather than JSON.
+
+    Form fields are strings, so anything nested - `reply_markup`, `media` -
+    travels as its JSON text; Telegram decodes it on the other side.
+    """
+    data = {k: v if isinstance(v, str) else json.dumps(v)
+            for k, v in payload.items() if v is not None}
+    r = await client.post(f"{API}/bot{token}/{method}", data=data, files=files)
+    return _answer(method, r)
+
+
+def _answer(method: str, r) -> dict:
     if r.status_code == 200:
         return r.json()
     # Telegram puts the actual reason in the body; the status alone is useless.
@@ -154,3 +172,26 @@ async def send_text(client, token: str, chat_id: str, text: str,
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return await api(client, token, "sendMessage", payload)
+
+
+async def send_photo(client, token: str, chat_id: str, png: bytes, caption: str,
+                     reply_markup: dict | None = None) -> dict:
+    return await upload(client, token, "sendPhoto",
+                        {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML",
+                         "reply_markup": reply_markup},
+                        {"photo": ("chart.png", png, "image/png")})
+
+
+async def edit_photo(client, token: str, chat_id: str, message_id: int, png: bytes,
+                     caption: str, reply_markup: dict | None = None) -> dict:
+    """Replace the picture a message carries, caption and buttons with it.
+
+    Not refused for a text message: Telegram adds the picture and the text is
+    gone. Which messages may be rewritten is the caller's decision to make.
+    """
+    return await upload(client, token, "editMessageMedia",
+                        {"chat_id": chat_id, "message_id": message_id,
+                         "media": {"type": "photo", "media": "attach://chart",
+                                   "caption": caption, "parse_mode": "HTML"},
+                         "reply_markup": reply_markup},
+                        {"chart": ("chart.png", png, "image/png")})

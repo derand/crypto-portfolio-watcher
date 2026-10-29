@@ -1,5 +1,5 @@
 # Portfolio watcher. Read-only by design: no keys, no signing, so the image
-# needs nothing but Python and four packages.
+# needs nothing but Python and five packages.
 FROM python:3.12-slim AS base
 
 # tzdata: digest.hour is a *local* hour, and .astimezone() in the digest needs a
