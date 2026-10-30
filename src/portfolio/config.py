@@ -110,6 +110,11 @@ class Thresholds(BaseModel):
     claim_reminder_usd: float = 50.0
     liq_distance_pct: float = 15.0
     """Shout when a perp's mark price is within this percent of liquidation."""
+    source_down_ticks: int = Field(default=4, ge=1)
+    """Say so once a source has failed this many ticks in a row, and again when
+    it answers. A source that stops answering otherwise reaches only the log and
+    /health, and its silence reads as all being well - for a validator, as never
+    going offline."""
 
 
 class PricesCfg(BaseModel):

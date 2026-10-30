@@ -240,6 +240,7 @@ promise as money. Beacon validators are on-chain — the ETH is staked, not depo
 | position grows on its own (validator) | `Position.accrues` | change → `accrual`, silent |
 | position moves on its own, not income (LP legs, HL account) | `Position.drifts` | no event; `position_snapshots` only |
 | money appears with nothing to explain it | neither flag | `anomaly` → alerts |
+| a source keeps failing | `cursors.fail_count` reaching `thresholds.source_down_ticks` | `service` once on the way down, once on the way back |
 
 The USD threshold (`thresholds.notify_usd`) applies to **transfers and position changes
 alike**, and measures the *change*, not the holding: a Hyperliquid spot balance drifts by

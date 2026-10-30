@@ -15,7 +15,7 @@ from .chains.base import Cursor, Target
 from .models import (Direction, EventKind, Message, Severity, format_display,
                      format_units)
 from .prices.sources import NATIVE_IDS
-from .retry import Unavailable
+from .retry import Permanent, Unavailable
 
 log = logging.getLogger(__name__)
 
@@ -110,8 +110,62 @@ def _mark_failure(conn, chain: str, address_id: int, scope: str = "") -> int:
         (chain, address_id, scope)).fetchone()["fail_count"]
 
 
-def _fail(conn, res, chain: str, address_id: int, scope: str, where: str,
-          e: Exception, unexpected: bool = True) -> None:
+def _for_ticks(cfg, ticks: int) -> str:
+    minutes = ticks * cfg.interval_minutes
+    span = f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes} min"
+    return f"{ticks} ticks (~{span})"
+
+
+def _reason(e: Exception) -> str:
+    """What failed, in words safe to send.
+
+    Only the provider's own exceptions are worded for a chat: the adapters build
+    them and pass every key through `retry.redact` on the way. Anything else
+    carries whatever text it was raised with - an httpx error holds the full URL,
+    and two providers keep their key in it - so it is named, not quoted.
+    """
+    if isinstance(e, (Unavailable, Permanent)):
+        return str(e)[:80]
+    return type(e).__name__
+
+
+def _service_event(conn, channels, chain: str, address_id: int, scope: str,
+                   uid: str, detail: str) -> None:
+    """A source going down or coming back, queued like any alert.
+
+    Through the queue rather than sent on the spot: a channel that happens to
+    be down at the same moment then delivers it next tick, and an outage
+    hitting every address at once arrives as one message, not one per scope.
+    """
+    now = _now()
+    cur = conn.execute(
+        """INSERT INTO events(chain, scope, address_id, uid, kind, ts, detail)
+           VALUES (?,?,?,?,?,?,?)""",
+        (chain, scope, address_id, f"{uid}:{scope}:{now}",
+         EventKind.SERVICE.value, now, detail))
+    _queue(conn, cur.lastrowid, channels)
+
+
+def _answered(cfg, conn, channels, chain: str, address_id: int, scope: str,
+              where: str) -> None:
+    """Say a source is back, if it was said to be down. Before `_save_cursor`,
+    which zeroes the count this reads.
+
+    The count is the whole of the state: it reached the threshold, so the
+    outage was announced. Changing `source_down_ticks` mid-outage can leave
+    the pair unmatched; that is the price of not keeping a flag next to it.
+    """
+    row = conn.execute(
+        "SELECT fail_count FROM cursors WHERE chain=? AND address_id=? AND scope=?",
+        (chain, address_id, scope)).fetchone()
+    if row and row["fail_count"] >= cfg.thresholds.source_down_ticks:
+        _service_event(conn, channels, chain, address_id, scope, "up",
+                       f"{where}: answering again after "
+                       f"{_for_ticks(cfg, row['fail_count'])}")
+
+
+def _fail(cfg, conn, res, channels, chain: str, address_id: int, scope: str,
+          where: str, e: Exception, unexpected: bool = True) -> None:
     """Record one scope as failed and let the tick go on.
 
     Whatever went wrong, it is this scope's problem, not the tick's: an
@@ -120,9 +174,17 @@ def _fail(conn, res, chain: str, address_id: int, scope: str, where: str,
     holds back the alerts for all of them, on every tick, until somebody fixes
     it by hand. The cursor is left where it was, so the scope is simply tried
     again next tick.
+
+    On exactly the `source_down_ticks`-th failure in a row it is also said, once:
+    a source that stops answering is otherwise silent, and silence is what
+    "nothing happened" looks like.
     """
     conn.execute("BEGIN")
     fails = _mark_failure(conn, chain, address_id, scope)
+    if fails == cfg.thresholds.source_down_ticks:
+        _service_event(conn, channels, chain, address_id, scope, "down",
+                       f"{where}: not answering for {_for_ticks(cfg, fails)}: "
+                       f"{_reason(e)}")
     conn.execute("COMMIT")
     if unexpected:
         log.exception("%s: unexpected failure (consecutive: %d)", where, fails)
@@ -463,19 +525,21 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
         probe = await adapter.probe(target, scope, cursor)
         if not probe.changed:
             conn.execute("BEGIN")
+            _answered(cfg, conn, channels, chain, address_id, scope, where)
             _save_cursor(conn, chain, address_id, cursor, scope)
             conn.execute("COMMIT")
             return
         res.changed += 1
         state = await adapter.fetch(target, scope, cursor, probe)
     except Unavailable as e:
-        _fail(conn, res, chain, address_id, scope, where, e, unexpected=False)
+        _fail(cfg, conn, res, channels, chain, address_id, scope, where, e,
+              unexpected=False)
         return
     except Exception as e:                           # noqa: BLE001
         # Anything else a provider can raise: a Permanent (Alchemy answers 403
         # for a network merely disabled in the dashboard) or a shape change
         # that comes out as KeyError. _fail says why it must not escape.
-        _fail(conn, res, chain, address_id, scope, where, e)
+        _fail(cfg, conn, res, channels, chain, address_id, scope, where, e)
         return
 
     counts = _counts(res)
@@ -567,6 +631,7 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
                         _signed(delta, snap.decimals, ""),
                         _signed(accounted, snap.decimals, ""))
 
+        _answered(cfg, conn, channels, chain, address_id, scope, where)
         _save_cursor(conn, chain, address_id, state.cursor, scope)
         conn.execute("COMMIT")
     except Exception as e:                           # noqa: BLE001
@@ -575,7 +640,7 @@ async def _scan_scope(cfg, conn, res, adapter, target, address_id, scope,
         # the cursor where it was, so nothing is lost by carrying on.
         conn.execute("ROLLBACK")
         _restore_counts(res, counts)
-        _fail(conn, res, chain, address_id, scope, where, e)
+        _fail(cfg, conn, res, channels, chain, address_id, scope, where, e)
         return
 
     if baseline:
@@ -652,6 +717,13 @@ def _who(counterparty: str | None) -> str:
 def render(events: list[dict]) -> Message:
     lines, high = [], False
     for e in events:
+        if e["kind"] == EventKind.SERVICE.value:
+            # The detail names the source itself: on the position path the
+            # source is the chain column, which the label alone would drop.
+            down = (e["uid"] or "").startswith("down:")
+            high = high or down
+            lines.append(f"{'⚠ ' if down else ''}{e['detail']}")
+            continue
         if e["kind"] == EventKind.ANOMALY.value:
             high = True
             lines.append(f"⚠ {e['label']}: {e['detail']}")
@@ -686,7 +758,11 @@ def render(events: list[dict]) -> Message:
         who = _who(e["counterparty"])
         lines.append(f"{where}  {arrow} {amount} {e['symbol'] or ''}{worth}  "
                      f"{who}{tail}".rstrip())
-    title = "Portfolio: 1 change" if len(events) == 1 else f"Portfolio: {len(events)} changes"
+    # A source going quiet is not a change to the portfolio, so it is not
+    # counted as one; a batch holding nothing else says what it is about.
+    n = sum(e["kind"] != EventKind.SERVICE.value for e in events)
+    title = ("Portfolio: sources" if n == 0 else
+             "Portfolio: 1 change" if n == 1 else f"Portfolio: {n} changes")
     return Message(title=title, body="\n".join(lines),
                    severity=Severity.HIGH if high else Severity.NORMAL,
                    kind=EventKind.TRANSFER)
@@ -824,16 +900,18 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
     try:
         positions, marker = await source.fetch(target)
     except Unavailable as e:
-        _fail(conn, res, chain, address_id, "", where, e, unexpected=False)
+        _fail(cfg, conn, res, channels, chain, address_id, "", where, e,
+              unexpected=False)
         return
     except Exception as e:                           # noqa: BLE001
         # Same reasoning as _scan_scope: one broken source must not cost the
         # delivery of what every other source already found.
-        _fail(conn, res, chain, address_id, "", where, e)
+        _fail(cfg, conn, res, channels, chain, address_id, "", where, e)
         return
 
     if marker == cursor.last_marker:
         conn.execute("BEGIN")
+        _answered(cfg, conn, channels, chain, address_id, "", where)
         _save_cursor(conn, chain, address_id, cursor)
         conn.execute("COMMIT")
         return
@@ -855,7 +933,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                   await _closed_trades(conn, source, target, chain, address_id,
                                        previous, positions))
     except Exception as e:                           # noqa: BLE001
-        _fail(conn, res, chain, address_id, "", where, e)
+        _fail(cfg, conn, res, channels, chain, address_id, "", where, e)
         return
 
     counts = _counts(res)
@@ -959,6 +1037,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                 res.new_events += 1
                 _queue(conn, eid, channels)
 
+        _answered(cfg, conn, channels, chain, address_id, "", where)
         _save_cursor(conn, chain, address_id, Cursor(last_marker=marker, last_item=marker))
         conn.execute("COMMIT")
     except Exception as e:                           # noqa: BLE001
@@ -966,7 +1045,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
         # change is looked at again next tick rather than lost.
         conn.execute("ROLLBACK")
         _restore_counts(res, counts)
-        _fail(conn, res, chain, address_id, "", where, e)
+        _fail(cfg, conn, res, channels, chain, address_id, "", where, e)
         return
 
     if baseline:

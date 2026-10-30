@@ -1857,3 +1857,117 @@ async def test_a_slashing_is_said(tmp_path):
         (*ON, "up"), ("active_slashed", "True", "down")])
     assert any("SLASHED" in s for s in said), said
     assert any("losing balance" in s for s in said), said
+
+
+class FlakyChain(FakeChain):
+    """A FakeChain whose provider can be switched off between ticks."""
+
+    def __init__(self, script, error=None):
+        super().__init__(script)
+        self.error = error
+
+    async def probe(self, t, scope, cursor):
+        if self.error is not None:
+            raise self.error
+        return await super().probe(t, scope, cursor)
+
+
+def said(router):
+    return [line for m in router.sent for line in m.body.splitlines()]
+
+
+async def outage(tmp_path, ticks, error=None, router=None):
+    """A baseline, then `ticks` failed ticks, then the provider answering again."""
+    cfg, conn = setup(tmp_path)
+    chain = FlakyChain({A1: [(100_000, [])], A2: [(0, [])]})
+    router = router or FakeRouter()
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    chain.error = error or pipeline.Unavailable("mempool.space: no answer")
+    for _ in range(ticks):
+        await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    return cfg, conn, chain, router
+
+
+async def test_a_source_that_stops_answering_is_said_once(tmp_path):
+    """Until now a dead provider reached the log and /health only, so its
+    silence read as nothing having happened - and for a validator, as never
+    going offline. Said on the fourth failure, and only then: every tick after
+    it would turn one outage into an alert every fifteen minutes."""
+    cfg, conn, chain, router = await outage(tmp_path, 3)
+    assert router.sent == [], "three failures can be a provider's bad hour"
+
+    for _ in range(3):
+        await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+
+    lines = said(router)
+    assert len(lines) == 2, lines            # one per address, both down
+    assert all("not answering for 4 ticks (~1h)" in s for s in lines), lines
+    assert "mempool.space: no answer" in lines[0]
+    assert router.sent[0].severity.value == "high"
+    assert router.sent[0].title == "Portfolio: sources", \
+        "an outage is not a change to the portfolio"
+
+
+async def test_a_source_that_answers_again_is_said_once(tmp_path):
+    """The pair to the outage: without it, the last word on a source is that it
+    is down, and nothing in the chat ever says otherwise."""
+    cfg, conn, chain, router = await outage(tmp_path, 5)
+    chain.error = None
+    for _ in range(2):
+        await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+
+    back = [s for s in said(router) if "answering again" in s]
+    assert len(back) == 2, said(router)
+    assert "after 5 ticks (~75 min)" in back[0]
+    assert conn.execute("SELECT MAX(fail_count) FROM cursors").fetchone()[0] == 0
+
+
+async def test_a_short_failure_comes_back_without_a_word(tmp_path):
+    """Recovery is said only where the outage was: an "answering again" for
+    a failure nobody was told about would be news about nothing."""
+    cfg, conn, chain, router = await outage(tmp_path, 3)
+    chain.error = None
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+    assert router.sent == []
+
+
+async def test_an_outage_said_while_the_channel_is_down_arrives_later(tmp_path):
+    """Queued as an event, not sent on the spot: the provider and Telegram can
+    be down in the same hour, and the outage must not be the alert that is lost
+    to the other one."""
+    router = FakeRouter(fail="telegram: 502")
+    cfg, conn, chain, router = await outage(tmp_path, 4, router=router)
+    router.fail = None
+    await pipeline.scan_once(cfg, conn, router, {"bitcoin": chain})
+
+    assert sum("not answering" in s for s in said(router)) == 4, \
+        "two refused on the fourth tick, the same two delivered on the fifth"
+    assert conn.execute("SELECT COUNT(*) FROM notifications WHERE status='pending'"
+                        ).fetchone()[0] == 0
+
+
+async def test_an_unexpected_failure_is_named_and_not_quoted(tmp_path):
+    """A provider's own exceptions are redacted where they are raised; anything
+    else carries the text it was raised with, and an httpx error carries the
+    full URL - which is where Alchemy keeps its key."""
+    secret = "https://eth-mainnet.g.alchemy.com/v2/abcdef0123456789"
+    cfg, conn, chain, router = await outage(tmp_path, 4, error=RuntimeError(secret))
+    text = "\n".join(said(router))
+    assert "RuntimeError" in text
+    assert "abcdef0123456789" not in text
+
+
+async def test_a_position_source_that_stops_answering_names_itself(tmp_path):
+    """On the position path the source is the event's chain, and a line
+    carrying only the label would not say which of an address's sources died."""
+    cfg, conn = setup_hl(tmp_path)
+
+    class Dead(FakeSource):
+        async def fetch(self, t):
+            raise pipeline.Unavailable("hyperliquid clearinghouseState failed")
+
+    router = FakeRouter()
+    for _ in range(4):
+        await run_hl(cfg, conn, router, Dead([]))
+    assert said(router) == ["⚠ hl-1/hyperliquid: not answering for 4 ticks (~1h): "
+                            "hyperliquid clearinghouseState failed"]

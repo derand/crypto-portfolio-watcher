@@ -12,6 +12,9 @@ thresholds:
   liq_distance_pct: 15.0
   # Phase 7: remind to claim once pending rewards exceed this.
   claim_reminder_usd: 50.0
+  # Say once that a source stopped answering after this many failed ticks in a
+  # row, and once more when it answers again. 4 ticks at 15 minutes is an hour.
+  source_down_ticks: 4
 
 prices:
   ttl_minutes: 15
