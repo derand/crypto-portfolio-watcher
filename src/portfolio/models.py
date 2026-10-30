@@ -182,6 +182,10 @@ class Trade:
     liquidated: bool = False
     """The position was closed by the exchange rather than by its owner. Worth
     its own word in the alert: the number alone does not say who decided."""
+    settles: str = ""
+    """The key of the position the result is paid into, when the venue reports
+    that balance too. Its change on the same tick is this trade said a second
+    time, so the pipeline announces only what is left of it."""
 
 
 @dataclass(slots=True)

@@ -259,6 +259,8 @@ async def test_a_close_reports_the_exchanges_own_realised_pnl():
     assert trades["perp:ETH"].pnl_usd == 12.5
     assert trades["perp:ETH"].fee_usd == 0.62
     assert not trades["perp:ETH"].liquidated
+    assert trades["perp:ETH"].settles == "spot:USDC", \
+        "without it the close is announced again as a USDC balance change"
     assert seen[0]["type"] == "userFillsByTime"
     assert seen[0]["startTime"] == 1788394000000, \
         "a fill from before the last scan belongs to a close already reported"

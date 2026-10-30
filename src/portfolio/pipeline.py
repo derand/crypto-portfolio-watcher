@@ -936,6 +936,7 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
         _fail(cfg, conn, res, channels, chain, address_id, "", where, e)
         return
 
+    settled = _settled(trades)
     counts = _counts(res)
     conn.execute("BEGIN")
     try:
@@ -982,6 +983,19 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                 # rang and the number that is read are the same number.
                 moved = _usd_of(prices, p.asset_key,
                                 p.amount_raw - (before or 0), p.decimals)
+                # The balance a close paid into moved by the close: two lines,
+                # both true, read as two events. Only what is left of the move
+                # is news - funding, a deposit at the same moment - and when
+                # that is under the threshold there is no event at all, or the
+                # digest counts the close twice too. Unpriced, nothing can be
+                # taken off, and the line stays as it was.
+                beyond = settled.get(p.key)
+                if beyond and before is not None and moved is not None:
+                    moved -= beyond[0]
+                    if not _worth_saying(cfg, moved):
+                        continue
+                else:
+                    beyond = None
                 # Except on a leveraged position, where it is a notional rather
                 # than money. A perp's dollars sitting in the same parentheses
                 # as a spot balance's would read as the same kind of thing.
@@ -994,7 +1008,9 @@ async def _scan_positions(cfg, conn, res, source, target, address_id, channels,
                     trade = trades.get(p.key)
                     eid = _position_event(
                         conn, chain, address_id, f"{p.key}:{before}>{p.amount_raw}",
-                        _changed_text(p, before, shown) + _trade_tail(trade),
+                        _changed_text(p, before, shown,
+                                      beyond[1] if beyond else ())
+                        + _trade_tail(trade),
                         p.amount_raw,
                         pnl_usd=trade.pnl_usd if trade else None, usd=shown)
                 if eid:
@@ -1108,13 +1124,21 @@ def _px(text: str) -> str:
     return out.rstrip("0").rstrip(".") if "." in out else out
 
 
-def _changed_text(p, before: int, usd: float | None = None) -> str:
+def _changed_text(p, before: int, usd: float | None = None,
+                  beyond: tuple[str, ...] = ()) -> str:
     """Signed, because the arrow says which way and not how much: a balance
     going 0.5 → 65.5 USDC and one going 0.0008 → 0.00001 UBTC are two sides of
-    one sale, and only the dollars make them recognisable as that."""
+    one sale, and only the dollars make them recognisable as that.
+
+    `beyond` names the closes this balance was paid by: the arrow is the whole
+    move, the dollars only what the closes do not explain, and without saying
+    so the two would not add up on the screen."""
+    tail = _usd_tail(usd, signed=True)
+    if beyond and tail:
+        noun = "close" if len(beyond) == 1 else "closes"
+        tail = f"{tail[:-1]} beyond the {', '.join(beyond)} {noun})"
     return (f"{p.key} {_fmt(before, p.decimals)} → "
-            f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}"
-            f"{_usd_tail(usd, signed=True)}")
+            f"{_fmt(p.amount_raw, p.decimals)} {p.symbol}{tail}")
 
 
 def _closed_text(key: str, before: int, row, trade,
@@ -1199,6 +1223,23 @@ async def _closed_trades(conn, source, target, chain: str, address_id: int,
         log.warning("%s/%s: closed %s, but no trade detail (%s)",
                     target.label, chain, ", ".join(sorted(closed)), e)
         return {}
+
+
+def _settled(trades: dict) -> dict[str, tuple[float, tuple[str, ...]]]:
+    """What this tick's closes paid into each balance, and which closes did.
+
+    The fee comes off when the venue priced it: it leaves the same balance the
+    profit enters. One it could not price is in some other coin, and taking it
+    off dollars would be arithmetic on two different units.
+    """
+    out: dict[str, tuple[float, tuple[str, ...]]] = {}
+    for key, trade in sorted(trades.items()):
+        if not trade.settles:
+            continue
+        paid = trade.pnl_usd - (trade.fee_usd or 0.0)
+        total, keys = out.get(trade.settles, (0.0, ()))
+        out[trade.settles] = (total + paid, keys + (key,))
+    return out
 
 
 def _since_ms(conn, chain: str, address_id: int) -> int | None:

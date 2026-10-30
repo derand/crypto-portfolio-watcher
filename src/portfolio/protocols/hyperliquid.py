@@ -310,7 +310,11 @@ def _closes(fills) -> dict[str, Trade]:
             pnl_usd=float(t["pnl"]),
             exit_px=str(px) if t["size"] else "",
             fee_usd=float(t["fee"]) if t["priced"] else None,
-            liquidated=t["liquidated"])
+            liquidated=t["liquidated"],
+            # Realised PnL lands in the collateral's spot balance, which `_spot`
+            # reports net of the open perps' PnL - so on the closing tick that
+            # balance moves by exactly this trade.
+            settles=f"spot:{COLLATERAL}")
     return out
 
 

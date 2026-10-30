@@ -1609,6 +1609,72 @@ async def test_a_liquidation_is_named_rather_than_left_to_the_minus_sign(tmp_pat
     assert "liquidated long 1.5 ETH" in body and "pnl -120.00" in body
 
 
+USDC_PRICED = {"hyperliquid:USDC": 1.0, "hyperliquid:ETH": 3000.0}
+
+
+async def _close_paid_into_usdc(tmp_path, after_usdc, trade):
+    """A perp closed while spot:USDC went from 100 to `after_usdc`."""
+    cfg, conn = setup_hl(tmp_path)
+    cfg.thresholds.notify_usd = 1.0
+    prices = FakePrices(USDC_PRICED)
+    src = TradingSource([[account(), spot(amount=10_000_000_000), perp()],
+                         [account(), spot(amount=after_usdc)]], trade)
+    router = FakeRouter()
+    for _ in range(2):
+        await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+    usdc = [r[0] for r in conn.execute(
+        "SELECT detail FROM events WHERE detail LIKE 'spot:USDC%'")]
+    return router, usdc
+
+
+async def test_a_close_is_not_announced_again_as_the_balance_it_paid_into(tmp_path):
+    """The venue pays a close's result into the collateral, so one tick used to
+    send "closed long 1.5 ETH pnl +12.50" and "spot:USDC 100 → 111.88 (+$11.88)"
+    - both true, and read together as two events, twice the money. Nor is the
+    second recorded below the threshold: the digest would count it as one more
+    position change beside the trade."""
+    router, usdc = await _close_paid_into_usdc(
+        tmp_path, 11_188_000_000, closed_trade(settles="spot:USDC"))   # +12.50 − 0.62
+
+    assert len(router.sent) == 1
+    assert "closed long 1.5 ETH" in router.sent[0].body
+    assert "spot:USDC" not in router.sent[0].body
+    assert usdc == []
+
+
+async def test_a_deposit_on_the_closing_tick_still_speaks_for_itself(tmp_path):
+    """Only what the close explains is taken off. $500 arriving in the same
+    interval is news, and the line has to say both the whole move and the part
+    of it that is new, or the arrow and the dollars disagree on the screen."""
+    router, usdc = await _close_paid_into_usdc(
+        tmp_path, 61_188_000_000, closed_trade(settles="spot:USDC"))
+
+    body = router.sent[0].body
+    assert "closed long 1.5 ETH" in body
+    assert ("spot:USDC 100 → 611.88 USDC (+$500.00 beyond the perp:ETH close)"
+            in body), body
+    assert len(usdc) == 1
+
+
+async def test_a_fee_paid_in_another_coin_is_not_taken_off_dollars(tmp_path):
+    """An unpriced fee is a quantity of something else. Subtracting nothing for
+    it leaves the balance's move exactly the PnL, which is what was paid."""
+    router, usdc = await _close_paid_into_usdc(
+        tmp_path, 11_250_000_000, closed_trade(settles="spot:USDC", fee_usd=None))
+
+    assert "spot:USDC" not in router.sent[0].body and usdc == []
+
+
+async def test_a_trade_that_names_no_balance_leaves_every_balance_alone(tmp_path):
+    """A venue that does not say where a result is paid gets the old behaviour:
+    nothing is subtracted from a balance on a guess."""
+    router, usdc = await _close_paid_into_usdc(tmp_path, 11_188_000_000,
+                                               closed_trade())
+
+    assert "spot:USDC 100 → 111.88 USDC (+$11.88)" in router.sent[0].body
+    assert len(usdc) == 1
+
+
 async def test_a_venue_that_fails_to_explain_still_delivers_the_alert(tmp_path):
     """The position closed either way. Losing the alert because the second
     request failed would trade the news for the footnote."""
