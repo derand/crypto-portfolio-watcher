@@ -184,7 +184,11 @@ stalest exactly when a position closes, because the price moving is usually why 
 So an unanswerable close says what closed and nothing about money, and `pnl_usd` stays
 NULL — which is also why the digest splits on `IS NOT NULL` rather than on a zero. The
 figure covers only trades whose position was in the database: one opened and closed inside
-a single interval is invisible, and no sum taken from the database can include it.
+a single interval is invisible, and no sum taken from the database can include it. A spot sale
+is a trade too (`spot:<token>`, its pair resolved through `spotMeta`), and `Trade.settles` is
+what tells the two apart downstream: a perp pays its PnL into the collateral, so that balance's
+move is the close said twice and only the remainder is announced; a sale pays its whole proceeds,
+which are the sale's other leg, so it names no balance and nothing is subtracted (PLAN §6).
 
 **Money is always an integer** in base units (`amount_raw` + `decimals`). Floats appear
 only in USD figures used for display and thresholds. A float creeping into an amount is a

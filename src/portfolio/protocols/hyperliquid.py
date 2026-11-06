@@ -130,10 +130,32 @@ class HyperliquidSource:
         reported, and counting it twice would put a wrong number in a message;
         losing one at the boundary only leaves the message without a number,
         which the caller is built to handle.
+
+        A spot fill names its pair by index, so spot needs a second request -
+        made only when the window holds one, which a perp-only close never pays.
         """
         body = {"type": "userFillsByTime", "user": t.address,
                 "startTime": int(since_ms or 0), "aggregateByTime": True}
-        return _closes(await self._info(body))
+        fills = await self._info(body)
+        pairs = await self._spot_pairs() if any(map(_is_spot, fills or [])) else {}
+        return _closes(fills, pairs)
+
+    async def _spot_pairs(self) -> dict[str, str]:
+        """Each USDC-quoted spot pair's name, to the position it trades.
+
+        Matched on the pair's own `name`, for the reason `hyperliquid_spot_mids`
+        gives: the lists here are not parallel to anything. A pair quoted in
+        anything else is left out, because its realised figure is not in dollars.
+        """
+        meta = await self._info({"type": "spotMeta"})
+        names = {t["index"]: t["name"] for t in meta.get("tokens") or []}
+        out = {}
+        for pair in meta.get("universe") or []:
+            tokens = pair.get("tokens") or []
+            if (len(tokens) == 2 and tokens[0] in names
+                    and names.get(tokens[1]) == COLLATERAL):
+                out[pair.get("name")] = f"spot:{names[tokens[0]]}"
+        return out
 
     @staticmethod
     def _account(state: dict) -> list[Position]:
@@ -254,13 +276,24 @@ def _realised(fill: dict) -> Decimal | None:
     words ("Close Long", and "Long > Short" for a flip, which realises the whole
     old position without the word "close" appearing anywhere). A non-zero
     `closedPnl` says the same thing in numbers. A liquidation says it a third
-    way. An opening fill fails all three.
+    way. An opening fill fails all three. On spot, "Sell" is the close: a sale
+    at exactly its cost closed something and made nothing.
     """
     pnl = _dec(fill.get("closedPnl"))
     direction = str(fill.get("dir") or "").lower()
-    if "close" in direction or ">" in direction or pnl != 0 or _liquidated(fill):
+    if ("close" in direction or ">" in direction or direction == "sell"
+            or pnl != 0 or _liquidated(fill)):
         return pnl
     return None
+
+
+def _is_spot(fill: dict) -> bool:
+    """Whether this fill traded a spot pair rather than a perp.
+
+    `dir` rather than the coin: a spot pair's name is an index or a slash-joined
+    pair depending on how it was listed, while perps only ever open and close.
+    """
+    return str(fill.get("dir") or "").lower() in ("buy", "sell")
 
 
 def _liquidated(fill: dict) -> bool:
@@ -273,24 +306,31 @@ def _liquidated(fill: dict) -> bool:
     return bool(fill.get("liquidation")) or "liquidat" in str(fill.get("dir") or "").lower()
 
 
-def _closes(fills) -> dict[str, Trade]:
+def _closes(fills, pairs: dict[str, str] | None = None) -> dict[str, Trade]:
     """Fills to one Trade per coin, keyed like the position it belongs to.
 
     Summed rather than taken one by one: an order is filled in as many pieces as
     the book requires, and three fills of the same close are one trade. The exit
     price is weighted by size for the same reason - the average of the prices is
     not the price it got out at.
+
+    `pairs` is `_spot_pairs`; a spot fill it does not know belongs to no position
+    and is dropped rather than filed under a key that matches nothing. A sale's
+    `closedPnl` has the buy's fee in its cost basis and its own fee outside, so
+    it reads exactly as a perp's does.
     """
     totals: dict[str, dict] = {}
     for fill in fills or []:
         coin = fill.get("coin")
-        pnl = _realised(fill) if coin else None
+        key = (pairs or {}).get(coin) if _is_spot(fill) else f"perp:{coin}"
+        pnl = _realised(fill) if coin and key else None
         if pnl is None:
             continue
         size = abs(_dec(fill.get("sz")))
-        entry = totals.setdefault(coin, {"pnl": Decimal(0), "fee": Decimal(0),
-                                         "size": Decimal(0), "notional": Decimal(0),
-                                         "liquidated": False, "priced": True})
+        entry = totals.setdefault(key, {"pnl": Decimal(0), "fee": Decimal(0),
+                                        "size": Decimal(0), "notional": Decimal(0),
+                                        "liquidated": False, "priced": True,
+                                        "spot": _is_spot(fill)})
         entry["pnl"] += pnl
         entry["size"] += size
         entry["notional"] += size * _dec(fill.get("px"))
@@ -304,17 +344,19 @@ def _closes(fills) -> dict[str, Trade]:
             entry["priced"] = False
 
     out = {}
-    for coin, t in totals.items():
+    for key, t in totals.items():
         px = t["notional"] / t["size"] if t["size"] else Decimal(0)
-        out[f"perp:{coin}"] = Trade(
+        out[key] = Trade(
             pnl_usd=float(t["pnl"]),
             exit_px=str(px) if t["size"] else "",
             fee_usd=float(t["fee"]) if t["priced"] else None,
             liquidated=t["liquidated"],
             # Realised PnL lands in the collateral's spot balance, which `_spot`
             # reports net of the open perps' PnL - so on the closing tick that
-            # balance moves by exactly this trade.
-            settles=f"spot:{COLLATERAL}")
+            # balance moves by exactly this trade. A spot sale pays in its whole
+            # proceeds instead, and taking its PnL off them leaves the cost of
+            # the purchase, printed as money that arrived.
+            settles="" if t["spot"] else f"spot:{COLLATERAL}")
     return out
 
 

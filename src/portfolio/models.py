@@ -183,9 +183,11 @@ class Trade:
     """The position was closed by the exchange rather than by its owner. Worth
     its own word in the alert: the number alone does not say who decided."""
     settles: str = ""
-    """The key of the position the result is paid into, when the venue reports
-    that balance too. Its change on the same tick is this trade said a second
-    time, so the pipeline announces only what is left of it."""
+    """The key of the position this trade's PnL alone is paid into, when the
+    venue reports that balance too. Its change on the same tick is this trade
+    said a second time, so the pipeline announces only what is left of it. Empty
+    when the balance moves by anything else: a spot sale pays in its proceeds,
+    and those are the sale's other leg rather than a repeat of its result."""
 
 
 @dataclass(slots=True)

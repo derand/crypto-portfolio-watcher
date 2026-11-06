@@ -228,6 +228,15 @@ async def test_a_spot_balance_carries_the_venues_token_index():
     assert spot["spot:USDC"].contract == "0"
 
 
+# Out of order on purpose, as the real lists are: `@7` is not the seventh pair.
+SPOT_META = {
+    "tokens": [{"index": 0, "name": "USDC"}, {"index": 3, "name": "COIN"},
+               {"index": 5, "name": "USDH"}],
+    "universe": [{"name": "@9", "index": 9, "tokens": [3, 5]},
+                 {"name": "@7", "index": 7, "tokens": [3, 0]},
+                 {"name": "COIN/USDC", "index": 0, "tokens": [3, 0]}]}
+
+
 def fills_source(fills):
     """A source whose only answer is a userFillsByTime response."""
     seen = []
@@ -235,7 +244,8 @@ def fills_source(fills):
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         seen.append(body)
-        return httpx.Response(200, json=fills)
+        return httpx.Response(200, json=SPOT_META if body["type"] == "spotMeta"
+                              else fills)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return HyperliquidSource(url="http://hl/info", client=client), seen
@@ -312,6 +322,79 @@ async def test_a_fee_paid_in_something_else_is_not_counted_as_dollars():
     trade = (await src.trades(TARGET))["perp:ETH"]
     assert trade.fee_usd is None
     assert trade.pnl_usd == 12.5, "the profit is still known"
+
+
+def sale(coin="@7", pnl="-34.17", sz="0.0069", px="75500.0", fee="0.35", **kw):
+    return fill(coin=coin, dir="Sell", pnl=pnl, sz=sz, px=px, fee=fee, **kw)
+
+
+async def test_a_spot_sale_is_filed_under_the_balance_it_sold():
+    """The fill says "@7", which is a pair and no position's key. Filed as
+    "perp:@7" it matched nothing, so the sale's result was never printed - and
+    once closes learned where they settle, it was taken for a perp paying into
+    USDC. It printed the purchase cost as money arrived, labelled "perp:@7"."""
+    src, seen = fills_source([sale()])
+    trades = await src.trades(TARGET)
+
+    assert list(trades) == ["spot:COIN"]
+    assert trades["spot:COIN"].pnl_usd == -34.17
+    assert trades["spot:COIN"].fee_usd == 0.35
+    assert [b["type"] for b in seen] == ["userFillsByTime", "spotMeta"]
+
+
+async def test_a_spot_sale_names_no_balance_it_settles_into():
+    """A sale pays its whole proceeds into USDC, not its PnL. That move is the
+    sale's other leg, and subtracting the PnL from it yields nothing real."""
+    src, _ = fills_source([sale()])
+    assert (await src.trades(TARGET))["spot:COIN"].settles == ""
+
+
+async def test_a_pair_listed_by_name_resolves_like_one_listed_by_index():
+    """The oldest pair is "COIN/USDC" where every other is "@n". The name comes
+    from the venue's own list, so neither spelling is special here."""
+    src, _ = fills_source([sale(coin="COIN/USDC")])
+    assert list(await src.trades(TARGET)) == ["spot:COIN"]
+
+
+async def test_a_perp_only_close_does_not_pay_for_the_spot_list():
+    """The metadata is one more request, and only a spot fill needs it."""
+    src, seen = fills_source([fill()])
+    await src.trades(TARGET)
+    assert [b["type"] for b in seen] == ["userFillsByTime"]
+
+
+async def test_a_perp_and_a_spot_sale_in_one_window_stay_separate():
+    """Only the perp's result is a repeat of the USDC move."""
+    src, _ = fills_source([fill(), sale()])
+    trades = await src.trades(TARGET)
+    assert trades["perp:ETH"].settles == "spot:USDC"
+    assert trades["spot:COIN"].settles == ""
+
+
+async def test_a_purchase_closes_nothing():
+    """Its fee is in the coin bought, and it realised nothing."""
+    src, _ = fills_source([fill(coin="@7", dir="Buy", pnl="0.0", token="COIN")])
+    assert await src.trades(TARGET) == {}
+
+
+async def test_a_sale_at_exactly_its_cost_is_still_a_trade():
+    """closedPnl of zero is an answer. Read as "closed nothing", the line would
+    lose its figure on the one sale where the figure is reassuring."""
+    src, _ = fills_source([sale(pnl="0.0")])
+    assert (await src.trades(TARGET))["spot:COIN"].pnl_usd == 0.0
+
+
+async def test_a_sale_quoted_in_another_coin_reports_no_figure():
+    """closedPnl is in the quote, and a USDH amount is not `pnl_usd`. Same rule
+    as a pair's price: only a USDC book is a dollar figure."""
+    src, _ = fills_source([sale(coin="@9")])
+    assert await src.trades(TARGET) == {}
+
+
+async def test_an_unlisted_pair_is_dropped_rather_than_filed_as_a_perp():
+    """A key that matches no position is how the first bug hid."""
+    src, _ = fills_source([sale(coin="@404")])
+    assert await src.trades(TARGET) == {}
 
 
 async def test_a_window_with_no_fills_reports_no_trades():

@@ -1163,7 +1163,8 @@ def _closed_text(key: str, before: int, row, trade,
     bits = [verb, side, _fmt(abs(before), decimals), symbol]
     if trade.exit_px:
         bits.append(f"@ {_px(trade.exit_px)}")
-    return " ".join(b for b in bits if b) + _trade_tail(trade, exit_px=False)
+    return (" ".join(b for b in bits if b) + _usd_tail(usd)
+            + _trade_tail(trade, exit_px=False))
 
 
 def _trade_tail(trade, exit_px: bool = True) -> str:

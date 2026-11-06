@@ -1675,6 +1675,87 @@ async def test_a_trade_that_names_no_balance_leaves_every_balance_alone(tmp_path
     assert len(usdc) == 1
 
 
+async def _sale_of_coin(tmp_path, after, trades):
+    """Half a COIN position sold, the proceeds landing in USDC."""
+    cfg, conn = setup_hl(tmp_path)
+    cfg.thresholds.notify_usd = 1.0
+    prices = FakePrices({"hyperliquid:USDC": 1.0, "hyperliquid:COIN": 80000.0})
+    src = TradingSource([[account(), spot(amount=10_000_000_000),
+                          spot("COIN", 1_000_000), perp()], after], trades)
+    router = FakeRouter()
+    for _ in range(2):
+        await pipeline.scan_once(cfg, conn, router, {}, {"hyperliquid": src}, prices)
+    return conn, router.sent[0].body
+
+
+SPOT_SALE = {"pnl_usd": -34.18, "exit_px": "75500.0", "fee_usd": 0.35}
+
+
+async def test_a_spot_sale_says_what_it_made_on_the_coin_that_was_sold(tmp_path):
+    """Spot is used here as a position with no liquidation, so a sale is the end
+    of a trade and its result is the question. It belongs on the coin's line,
+    and is the venue's figure rather than one derived from two balances."""
+    conn, body = await _sale_of_coin(
+        tmp_path,
+        [account(), spot(amount=62_060_000_000), spot("COIN", 300_000), perp()],
+        {"spot:COIN": Trade(**SPOT_SALE)})
+
+    assert ("spot:COIN 0.01 → 0.003 COIN (-$560.00)   @ 75,500   pnl -34.18   "
+            "fee 0.35") in body, body
+    assert pnl_column(conn).count(-34.18) == 1
+
+
+async def test_a_spot_sale_leaves_its_proceeds_whole(tmp_path):
+    """The bug this replaces: a sale at a loss read "(+$X beyond the perp:@7
+    close)" with X above what USDC had risen by. Proceeds minus PnL is the cost
+    of the purchase, which never arrived anywhere. The second leg stays a plain
+    second leg."""
+    _, body = await _sale_of_coin(
+        tmp_path,
+        [account(), spot(amount=62_060_000_000), spot("COIN", 300_000), perp()],
+        {"spot:COIN": Trade(**SPOT_SALE)})
+
+    assert "spot:USDC 100 → 620.6 USDC (+$520.60)" in body, body
+    assert "beyond" not in body
+
+
+async def test_a_perp_close_beside_a_spot_sale_explains_only_its_own_part(tmp_path):
+    """Both in one interval: the perp's result comes off USDC, the sale's stays
+    in it as proceeds. What is left is exactly what the sale paid."""
+    _, body = await _sale_of_coin(
+        tmp_path,
+        [account(), spot(amount=62_560_000_000), spot("COIN", 300_000)],
+        {"spot:COIN": Trade(**SPOT_SALE),
+         "perp:ETH": Trade(pnl_usd=5.0, settles="spot:USDC")})
+
+    assert "(+$520.60 beyond the perp:ETH close)" in body, body
+
+
+async def test_a_spot_position_sold_outright_keeps_its_dollars(tmp_path):
+    """Selling everything takes the close path, not the change path. A perp has
+    no dollars there on purpose - a notional is not money - but a coin does."""
+    _, body = await _sale_of_coin(
+        tmp_path, [account(), spot(amount=88_000_000_000), perp()],
+        {"spot:COIN": Trade(**SPOT_SALE)})
+
+    assert "closed 0.01 COIN @ 75,500 ($800.00)   pnl -34.18   fee 0.35" in body, body
+
+
+async def test_a_spot_sale_counts_among_the_days_closed_trades(tmp_path):
+    """A profit is measured in dollars here however it was held, so the digest's
+    closed line has to include spot or it understates the day. The USDC leg
+    stays a position change rather than a second trade."""
+    conn, _ = await _sale_of_coin(
+        tmp_path,
+        [account(), spot(amount=62_060_000_000), spot("COIN", 300_000), perp()],
+        {"spot:COIN": Trade(**SPOT_SALE)})
+
+    rows = [dict(r) for r in conn.execute("SELECT kind, pnl_usd FROM events")]
+    summary, _ = digest._last24h(rows)
+    assert "1 closed, pnl $-34.18" in summary, summary
+    assert "1 position change" in summary, summary
+
+
 async def test_a_venue_that_fails_to_explain_still_delivers_the_alert(tmp_path):
     """The position closed either way. Losing the alert because the second
     request failed would trade the news for the footnote."""
